@@ -20,6 +20,8 @@ const HOME = process.env.HOME || process.env.USERPROFILE || "";
 
 const PACKAGE_NAME = "@dillydalli3r/oh-my-pi-supreme-token-saver";
 const PACKAGE_BIN = "oh-my-pi-supreme-token-saver";
+// Fallback source for `update` while the fork is not published under PACKAGE_NAME yet.
+const GIT_SOURCE = "github:dillydalli3r/oh-my-pi-supreme-token-saver";
 // Ponytail session default: ultra keeps a fresh session identical to `/combo max`.
 const PONYTAIL_DEFAULT_MODE = "ultra";
 const { version: PACKAGE_VERSION } = createRequire(import.meta.url)("./package.json");
@@ -56,7 +58,7 @@ function printHelp() {
 
 Commands:
   install      Install the add-ons (user scope by default)
-  update       Run the latest published installer
+  update       Run the latest installer (npm package, else the GitHub source)
   reinstall    Clean and reinstall the user-scope add-ons
   doctor       Check the current installation
   uninstall    Remove the managed extensions
@@ -908,37 +910,57 @@ async function runLatestUpdate() {
   if (dryRun) forwardedArgs.push("--dry-run");
   if (verbose) forwardedArgs.push("--verbose");
 
-  const npmArgs = [
-    "exec",
-    "--yes",
-    "--prefer-online",
-    `--package=${PACKAGE_NAME}@latest`,
-    "--",
-    PACKAGE_BIN,
-    "--apply-update",
-    ...forwardedArgs,
+  // Prefer the published package; fall back to the GitHub source, which is the documented install
+  // path while this fork is unpublished. npm 11+ needs --allow-git=all for git specifiers.
+  const npmVersion = String((await execCli("npm", ["--version"]).catch(() => ({ stdout: "0" }))).stdout).trim();
+  const npmMajor = Number(npmVersion.split(".")[0]) || 0;
+  const sources = [
+    { label: `${PACKAGE_NAME}@latest`, spec: `${PACKAGE_NAME}@latest`, extra: [] },
+    { label: GIT_SOURCE, spec: GIT_SOURCE, extra: npmMajor >= 11 ? ["--allow-git=all"] : [] },
   ];
 
-  const npmCommand = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : "npm";
-  const npmCommandArgs = IS_WINDOWS ? ["/d", "/s", "/c", "npm", ...npmArgs] : npmArgs;
-
   console.log("=== Updating OMP Supreme Token Saver ===");
-  console.log(`  Running the latest ${PACKAGE_NAME} installer...\n`);
 
-  try {
-    const result = await execP(npmCommand, npmCommandArgs, {
-      timeout: 300000,
-      maxBuffer: 10 * 1024 * 1024,
-      windowsHide: true,
-      shell: false,
-    });
-    if (result.stdout) process.stdout.write(result.stdout);
-    if (result.stderr) process.stderr.write(result.stderr);
-    console.log("\n=== Update complete ===");
-  } catch (e) {
-    if (e.stdout) process.stdout.write(e.stdout);
-    if (e.stderr) process.stderr.write(e.stderr);
-    console.error(`\n[fail] Could not run ${PACKAGE_NAME}@latest: ${e.message}`);
+  let updated = false;
+  for (const source of sources) {
+    console.log(`  Running the latest installer from ${source.label}...\n`);
+    const npmArgs = [
+      "exec",
+      "--yes",
+      "--prefer-online",
+      ...source.extra,
+      `--package=${source.spec}`,
+      "--",
+      PACKAGE_BIN,
+      "--apply-update",
+      ...forwardedArgs,
+    ];
+
+    const npmCommand = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : "npm";
+    const npmCommandArgs = IS_WINDOWS ? ["/d", "/s", "/c", "npm", ...npmArgs] : npmArgs;
+
+    try {
+      const result = await execP(npmCommand, npmCommandArgs, {
+        timeout: 300000,
+        maxBuffer: 10 * 1024 * 1024,
+        windowsHide: true,
+        shell: false,
+      });
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.stderr) process.stderr.write(result.stderr);
+      console.log("\n=== Update complete ===");
+      updated = true;
+      break;
+    } catch (e) {
+      if (e.stdout) process.stdout.write(e.stdout);
+      if (e.stderr) process.stderr.write(e.stderr);
+      console.log(`  [warn] ${source.label} failed: ${e.message}\n`);
+    }
+  }
+
+  if (!updated) {
+    console.error(`[fail] Could not update from ${sources.map((s) => s.label).join(" or ")}`);
+    console.error("[hint] Install manually: node install-omp-addons.js install --yes");
     process.exitCode = 1;
   }
 }

@@ -32,7 +32,7 @@ The installer copies the bundled extensions into `~/.omp/agent/extensions`, regi
 
 Individual toggles: `/caveman ultra` · `/rtk on` · `/ponytail ultra`
 
-`update` re-runs the published installer from npm, so it needs this fork published under its own name first (`npm login` then `npm publish --access public`). Until then use `npx --yes --allow-git=all github:dillydalli3r/oh-my-pi-supreme-token-saver install --yes` or `reinstall`.
+`update` runs the latest installer: the npm package when this fork is published (`npm login` then `npm publish --access public`), otherwise the GitHub source automatically — the same source the install command above uses. `reinstall` rebuilds from the local checkout instead.
 
 ## What it installs
 
@@ -62,7 +62,7 @@ After the global install, use these short commands for routine maintenance:
 | Command | Purpose |
 |---|---|
 | `oh-my-pi-supreme-token-saver install` | Install non-interactively to user scope by default; use `--scope project` or `--scope both` for another scope |
-| `oh-my-pi-supreme-token-saver update` | Fetch the latest release and refresh the user installation |
+| `oh-my-pi-supreme-token-saver update` | Run the latest installer — the npm package when published, otherwise the GitHub source |
 | `oh-my-pi-supreme-token-saver reinstall` | Remove the bundled extension directories and RTK binary, then install fresh at user scope; the separate Ponytail package is preserved and refreshed |
 | `oh-my-pi-supreme-token-saver doctor` | Check OMP, extension, Ponytail, and RTK installation health |
 | `oh-my-pi-supreme-token-saver uninstall` | Remove bundled extensions; add `--remove-rtk` to remove the RTK binary or `--remove-ponytail` to unregister Ponytail's extension path (the Ponytail package remains installed) |
@@ -197,7 +197,13 @@ It must resolve to a Linux path such as `~/.nvm/versions/node/.../bin/npm`, not 
 
 ## Advanced: one-off use
 
-Without keeping the package globally installed, run the latest release once:
+Without keeping the package globally installed, run the latest commit once:
+
+```bash
+npx --yes --allow-git=all github:dillydalli3r/oh-my-pi-supreme-token-saver install --yes
+```
+
+Once the fork is published to npm, the registry form works too:
 
 ```bash
 npm exec --yes --prefer-online --package=@dillydalli3r/oh-my-pi-supreme-token-saver@latest -- oh-my-pi-supreme-token-saver install
