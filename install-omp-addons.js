@@ -6,7 +6,8 @@
 import https from "node:https";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -17,6 +18,10 @@ import readline from "node:readline";
 
 const IS_WINDOWS = process.platform === "win32";
 const HOME = process.env.HOME || process.env.USERPROFILE || "";
+
+// Scope codes for the user/project/both choices, shared by the install, reinstall, and uninstall
+// paths so all three agree on what a scope name means.
+const SCOPE_CODES = { user: "1", project: "2", both: "3" };
 
 const PACKAGE_NAME = "@dillydalli3r/oh-my-pi-supreme-token-saver";
 const PACKAGE_BIN = "oh-my-pi-supreme-token-saver";
@@ -105,7 +110,7 @@ Internal (set by \`update\`, not a user flag):
 
 The extension ships one command surface: /token-saver (alias /ts), with /combo kept
 as a preset-only alias. The presets (off, lite, medium, high, max, ultra) drive all
-eight knobs — caveman, rtk, ponytail, read, compress, prune, autoRtk, status.`);
+nine knobs — caveman, rtk, ponytail, read, compress, prune, threshold, autoRtk, status.`);
 }
 
 function debug(...a) {
@@ -130,6 +135,8 @@ const UPDATER_INDEX = path.join(EXT_DIR, "ai-addons-updater", "index.js");
 const TOKEN_SAVER_DIR = path.join(EXT_DIR, "token-saver");
 const TOKEN_SAVER_INDEX = path.join(TOKEN_SAVER_DIR, "index.js");
 const AMANAI_REWARD_INDEX = path.join(EXT_DIR, "amanai-reward", "index.js");
+// Second entry point of the same package, declared in package.json `pi.extensions`.
+const AMANAI_REWARD_PI = path.join(EXT_DIR, "amanai-reward", "pi.js");
 // Pre-2.0 shipped a separate combo extension directory that registered a duplicate /combo command;
 // 2.0 folds that surface into token-saver. The stale directory name is spelled out once, here, so
 // no other line hardcodes it.
@@ -146,8 +153,10 @@ const DEFAULT_PRESET = "max";
 // --- Helpers ---
 
 async function sha256File(filePath) {
-  const buf = await fs.readFile(filePath);
-  return createHash("sha256").update(buf).digest("hex");
+  // Streamed: the RTK archives are tens of MB and hashing used to hold the whole file in memory.
+  const hash = createHash("sha256");
+  await pipeline(createReadStream(filePath), hash);
+  return hash.digest("hex");
 }
 
 async function readIfExists(p) {
@@ -174,6 +183,9 @@ function parseChecksum(checksumsText, assetName) {
 // before the shell prompt returns). A stalled connection also has to fail, not hang the install.
 const HTTP_AGENT = new https.Agent({ keepAlive: false });
 const HTTP_TIMEOUT_MS = 30000;
+// Redirects are followed by hand, so the hop count must be bounded: a redirect loop would otherwise
+// recurse until the stack or the network gives up.
+const MAX_REDIRECTS = 5;
 
 function httpsRequest(url, onResponse) {
   const req = https.get(
@@ -185,12 +197,15 @@ function httpsRequest(url, onResponse) {
   return req;
 }
 
-async function httpsGet(url) {
+async function httpsGet(url, redirects = 0) {
   return new Promise((resolve, reject) => {
     const req = httpsRequest(url, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        httpsGet(new URL(res.headers.location, url).href).then(resolve).catch(reject);
+        if (redirects >= MAX_REDIRECTS) {
+          return reject(new Error(`too many redirects (${MAX_REDIRECTS}): ${url}`));
+        }
+        httpsGet(new URL(res.headers.location, url).href, redirects + 1).then(resolve).catch(reject);
         return;
       }
       if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`)); }
@@ -202,12 +217,15 @@ async function httpsGet(url) {
   });
 }
 
-async function httpsDownload(url, dest) {
+async function httpsDownload(url, dest, redirects = 0) {
   return new Promise((resolve, reject) => {
     const req = httpsRequest(url, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        httpsDownload(new URL(res.headers.location, url).href, dest).then(resolve).catch(reject);
+        if (redirects >= MAX_REDIRECTS) {
+          return reject(new Error(`too many redirects (${MAX_REDIRECTS}): ${url}`));
+        }
+        httpsDownload(new URL(res.headers.location, url).href, dest, redirects + 1).then(resolve).catch(reject);
         return;
       }
       if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`)); }
@@ -220,10 +238,8 @@ async function httpsDownload(url, dest) {
   });
 }
 
-const execFileP = promisify(execFile);
-
 function execP(cmd, args, opts = {}) {
-  return execFileP(cmd, args, {
+  return promisify(execFile)(cmd, args, {
     timeout: opts.timeout || 120000,
     encoding: "utf8",
     ...opts,
@@ -263,76 +279,97 @@ async function writeIfChanged(dest, content, options = {}) {
   return true;
 }
 
+// Every config.yml edit is the same three steps — read, rewrite the lines, write back — with a dry
+// run reporting the same outcome instead of touching the file. `transform` returns the new lines, or
+// null when there is nothing to change.
+async function rewriteConfigLines(configPath, transform, options = {}) {
+  const raw = await readIfExists(configPath);
+  const lines = (raw || "").split("\n");
+  const updated = transform(lines);
+
+  if (!updated) {
+    if (options.noChangeDebug) debug(options.noChangeDebug);
+    return false;
+  }
+
+  // Message text is the caller's: "removed 2 entries" and "added the extension" differ in wording
+  // and only the caller knows which one it means.
+  const removed = lines.length - updated.length;
+  if (options.dryRun) {
+    console.log(`  [dry-run] ${options.dryRunMessage(removed)}`);
+    return true;
+  }
+
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.writeFile(configPath, updated.join("\n"), "utf8");
+  console.log(`  [write] ${options.writeMessage(removed)}`);
+  return true;
+}
+
+// Only a real `- <path>` entry counts as registered. A substring test also matched a commented-out
+// line, which then counted as registered and the extension was silently never added.
+function isRegisteredEntry(line, normalizedPath) {
+  return line.trim().replace(/^-\s*/, "") === normalizedPath;
+}
+
 async function ensureExtensionInConfig(configPath, extensionPath, label, options = {}) {
   const normalizedPath = extensionPath.replace(/\\/g, "/");
   const line = `  - ${normalizedPath}`;
 
-  let raw = await readIfExists(configPath);
-  let lines = (raw || "").split("\n");
+  return rewriteConfigLines(configPath, (lines) => {
+    if (lines.some((l) => isRegisteredEntry(l, normalizedPath))) return null;
 
-  if (lines.some((l) => l.includes(normalizedPath))) {
-    debug(`${label} already in config.yml`);
-    return false;
-  }
-
-  const extLineIdx = lines.findIndex((l) => /^\s*extensions\s*:/i.test(l));
-
-  if (options.dryRun) {
-    console.log(`  [dry-run] would add ${label} to config.yml: ${normalizedPath}`);
-    return true;
-  }
-
-  // Handle "extensions: []" (empty YAML array)
-  const emptyArrayIdx = lines.findIndex((l) => /^\s*extensions\s*:\s*\[\s*\]\s*$/i.test(l));
-  if (emptyArrayIdx !== -1) {
-    lines[emptyArrayIdx] = "extensions:";
-    lines.splice(emptyArrayIdx + 1, 0, line, "");
-  } else if (extLineIdx === -1) {
-    lines.push("extensions:");
-    lines.push(line);
-    lines.push("");
-  } else {
-    lines.splice(extLineIdx + 1, 0, line);
-  }
-
-  await fs.mkdir(path.dirname(configPath), { recursive: true });
-  await fs.writeFile(configPath, lines.join("\n"), "utf8");
-  console.log(`  [write] Added ${label} to config.yml`);
-  return true;
+    // Handle "extensions: []" (empty YAML array)
+    const emptyArrayIdx = lines.findIndex((l) => /^\s*extensions\s*:\s*\[\s*\]\s*$/i.test(l));
+    const extLineIdx = lines.findIndex((l) => /^\s*extensions\s*:/i.test(l));
+    if (emptyArrayIdx !== -1) {
+      lines[emptyArrayIdx] = "extensions:";
+      lines.splice(emptyArrayIdx + 1, 0, line, "");
+    } else if (extLineIdx === -1) {
+      lines.push("extensions:");
+      lines.push(line);
+      lines.push("");
+    } else {
+      lines.splice(extLineIdx + 1, 0, line);
+    }
+    return lines;
+  }, {
+    dryRun: options.dryRun,
+    noChangeDebug: `${label} already in config.yml`,
+    dryRunMessage: () => `would add ${label} to config.yml: ${normalizedPath}`,
+    writeMessage: () => `Added ${label} to config.yml`,
+  });
 }
 
 async function ensureExtensionAfterConfigEntry(configPath, extensionPath, afterPath, label, options = {}) {
   const normalizedPath = extensionPath.replace(/\\/g, "/");
   const normalizedAfterPath = afterPath.replace(/\\/g, "/");
   const line = `  - ${normalizedPath}`;
-  const raw = await readIfExists(configPath);
-  const lines = (raw || "").split("\n");
-  const existingIndex = lines.findIndex((entry) => entry.includes(normalizedPath));
-  const afterIndex = lines.findIndex((entry) => entry.includes(normalizedAfterPath));
 
-  if (existingIndex !== -1 && afterIndex !== -1 && existingIndex === afterIndex + 1) return false;
-  if (options.dryRun) {
-    console.log(`  [dry-run] would place ${label} after Ponytail in config.yml: ${normalizedPath}`);
-    return true;
-  }
+  return rewriteConfigLines(configPath, (lines) => {
+    const existingIndex = lines.findIndex((entry) => isRegisteredEntry(entry, normalizedPath));
+    const afterIndex = lines.findIndex((entry) => isRegisteredEntry(entry, normalizedAfterPath));
 
-  if (existingIndex !== -1) lines.splice(existingIndex, 1);
-  const refreshedAfterIndex = lines.findIndex((entry) => entry.includes(normalizedAfterPath));
-  if (refreshedAfterIndex !== -1) {
-    lines.splice(refreshedAfterIndex + 1, 0, line);
-  } else {
-    const extensionsIndex = lines.findIndex((entry) => /^\s*extensions\s*:/i.test(entry));
-    if (extensionsIndex === -1) {
-      lines.push("extensions:", line, "");
+    if (existingIndex !== -1 && afterIndex !== -1 && existingIndex === afterIndex + 1) return null;
+
+    if (existingIndex !== -1) lines.splice(existingIndex, 1);
+    const refreshedAfterIndex = lines.findIndex((entry) => isRegisteredEntry(entry, normalizedAfterPath));
+    if (refreshedAfterIndex !== -1) {
+      lines.splice(refreshedAfterIndex + 1, 0, line);
     } else {
-      lines.splice(extensionsIndex + 1, 0, line);
+      const extensionsIndex = lines.findIndex((entry) => /^\s*extensions\s*:/i.test(entry));
+      if (extensionsIndex === -1) {
+        lines.push("extensions:", line, "");
+      } else {
+        lines.splice(extensionsIndex + 1, 0, line);
+      }
     }
-  }
-
-  await fs.mkdir(path.dirname(configPath), { recursive: true });
-  await fs.writeFile(configPath, lines.join("\n"), "utf8");
-  console.log(`  [write] Placed ${label} after Ponytail in config.yml`);
-  return true;
+    return lines;
+  }, {
+    dryRun: options.dryRun,
+    dryRunMessage: () => `would place ${label} after Ponytail in config.yml: ${normalizedPath}`,
+    writeMessage: () => `Placed ${label} after Ponytail in config.yml`,
+  });
 }
 
 // The plugin resolves its config as $XDG_CONFIG_HOME, then %APPDATA% on Windows, then ~/.config.
@@ -420,12 +457,9 @@ async function stepPonytail(pluginsDir, userDir, options = {}) {
   pkg.dependencies = pkg.dependencies || {};
   pkg.dependencies["@dietrichgebert/ponytail"] = "github:DietrichGebert/ponytail";
 
-  if (options.dryRun) {
-    console.log(`  [dry-run] would write ${pkgPath}`);
-  } else {
-    await fs.writeFile(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
-    console.log(`  [write] ${pkgPath}`);
-  }
+  // Through writeIfChanged: the same pkg object is rebuilt on every install, so an unchanged
+  // package.json used to be rewritten and re-logged on each run.
+  await writeIfChanged(pkgPath, JSON.stringify(pkg, null, 2) + "\n", options);
 
   if (options.dryRun) {
     console.log("  [dry-run] would run: omp plugin install github:DietrichGebert/ponytail");
@@ -559,6 +593,10 @@ async function stepRtk(binDir, options = {}) {
     return;
   }
 
+  // The temp dir holds a partial download and the extracted tree; any exit from here — including a
+  // throw from the download or the extraction — has to take it with it, so the cleanup is in the
+  // finally rather than on each return path.
+  let tmpDir = null;
   try {
     const raw = await httpsGet(RTK_RELEASE_API);
     const release = JSON.parse(raw);
@@ -594,7 +632,7 @@ async function stepRtk(binDir, options = {}) {
       }
     }
 
-    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rtk-"));
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rtk-"));
     const archivePath = path.join(tmpDir, asset.name);
 
     await httpsDownload(asset.browser_download_url, archivePath);
@@ -609,7 +647,6 @@ async function stepRtk(binDir, options = {}) {
         console.log(`  [fail] Checksum mismatch for ${asset.name}`);
         console.log(`  [fail] Expected: ${expected}`);
         console.log(`  [fail] Got:      ${actual}`);
-        await fs.rm(tmpDir, { recursive: true, force: true });
         return;
       } else {
         console.log(`  [ok] Checksum verified for ${asset.name}`);
@@ -644,7 +681,6 @@ async function stepRtk(binDir, options = {}) {
       }
     } else {
       console.log(`  [fail] Unknown archive format: ${asset.name}`);
-      await fs.rm(tmpDir, { recursive: true, force: true });
       return;
     }
 
@@ -655,7 +691,6 @@ async function stepRtk(binDir, options = {}) {
     const found = entries.find((e) => path.basename(e) === binaryName);
     if (!found) {
       console.log(`  [fail] Could not find ${binaryName} in extracted archive`);
-      await fs.rm(tmpDir, { recursive: true, force: true });
       return;
     }
 
@@ -677,29 +712,29 @@ async function stepRtk(binDir, options = {}) {
       console.log(`  [hint] Verify manually: ${binDest} --version`);
     }
 
-    // Cleanup
-    await fs.rm(tmpDir, { recursive: true, force: true });
   } catch (e) {
     console.log(`  [fail] RTK: ${e.message}`);
     console.log(`  [hint] Manual: https://github.com/rtk-ai/rtk/releases`);
+  } finally {
+    if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true });
   }
 }
 
-async function stepSharedSessionState(extDir, options = {}) {
+// The step functions below take their file text from the caller: `--scope both` installs the same
+// sources into two trees, and re-reading them per scope was pure duplicate work.
+async function stepSharedSessionState(extDir, sources, options = {}) {
   stepHeader("Installing shared session state and status line...");
-  const src = await readIfExists(SHARED_SESSION_STATE);
-  if (!src) {
+  if (!sources.sessionState) {
     console.log("  [skip] shared/session-state.js not found in repo");
   } else {
-    await writeIfChanged(path.join(extDir, "shared", "session-state.js"), src, options);
+    await writeIfChanged(path.join(extDir, "shared", "session-state.js"), sources.sessionState, options);
   }
 
-  const statusSrc = await readIfExists(SHARED_STATUS_LINE);
-  if (!statusSrc) {
+  if (!sources.statusLine) {
     console.log("  [skip] shared/status-line.js not found in repo");
     return;
   }
-  await writeIfChanged(path.join(extDir, "shared", "status-line.js"), statusSrc, options);
+  await writeIfChanged(path.join(extDir, "shared", "status-line.js"), sources.statusLine, options);
 }
 
 async function stepModeReinforcement(extDir, ponytailExtPath, options = {}) {
@@ -714,48 +749,35 @@ async function stepModeReinforcement(extDir, ponytailExtPath, options = {}) {
   await ensureExtensionAfterConfigEntry(path.join(path.dirname(extDir), "config.yml"), dest, ponytailExtPath, "mode reinforcement", options);
 }
 
-async function stepRtkSession(extDir, options = {}) {
+async function stepRtkSession(extDir, sources, options = {}) {
   stepHeader("Installing RTK session extension...");
-  const src = await readIfExists(RTK_SESSION_INDEX);
-  if (!src) {
+  if (!sources.rtkSession) {
     console.log("  [skip] rtk-session/index.js not found in repo");
     return;
   }
   const dest = path.join(extDir, "rtk-session", "index.js");
-  await writeIfChanged(dest, src, options);
+  await writeIfChanged(dest, sources.rtkSession, options);
 }
 
-async function stepCaveman(extDir, options = {}) {
+async function stepCaveman(extDir, sources, options = {}) {
   stepHeader("Installing Caveman session extension...");
   const cavemanDir = path.join(extDir, "caveman-session");
   if (!options.dryRun) await fs.mkdir(cavemanDir, { recursive: true });
 
-  // The bundled rule is always a valid destination: dry runs stay offline, and a failed remote
-  // fetch falls back to it instead of aborting the install with the remaining steps unrun.
-  const bundledRule = await readIfExists(path.join(path.dirname(CAVEMAN_INDEX), "rule.md")) || "";
-  let rule = bundledRule;
-  if (!options.dryRun) {
-    try {
-      rule = await httpsGet(CAVEMAN_REMOTE_RULE) || bundledRule;
-    } catch (e) {
-      console.log(`  [warn] Could not fetch ${CAVEMAN_REMOTE_RULE} (${e.message}) — using the bundled rule`);
-    }
-  }
-  await writeIfChanged(path.join(cavemanDir, "rule.md"), rule, options);
+  // sources.cavemanRule is the bundled rule unless main() already replaced it with the remote copy.
+  await writeIfChanged(path.join(cavemanDir, "rule.md"), sources.cavemanRule, options);
 
   // Write index.js
-  const src = await readIfExists(CAVEMAN_INDEX);
-  if (!src) {
+  if (!sources.cavemanIndex) {
     console.log("  [skip] caveman-session/index.js not found in repo");
     return;
   }
-  await writeIfChanged(path.join(cavemanDir, "index.js"), src, options);
+  await writeIfChanged(path.join(cavemanDir, "index.js"), sources.cavemanIndex, options);
 
   // Write updater
-  const updaterSrc = await readIfExists(UPDATER_INDEX);
-  if (updaterSrc) {
+  if (sources.updater) {
     const updaterDest = path.join(extDir, "ai-addons-updater", "index.js");
-    await writeIfChanged(updaterDest, updaterSrc, options);
+    await writeIfChanged(updaterDest, sources.updater, options);
   } else {
     console.log("  [skip] ai-addons-updater/index.js not found in repo");
   }
@@ -782,20 +804,14 @@ async function stepTokenSaver(extDir, options = {}) {
 
   // The same install also listed it in config.yml. A dangling entry there still gets loaded, so the
   // line goes even when the directory was already gone.
-  const configRaw = await readIfExists(configPath);
-  if (configRaw) {
-    const lines = configRaw.split("\n");
+  await rewriteConfigLines(configPath, (lines) => {
     const kept = lines.filter((l) => !l.includes(STALE_COMBO_DIRNAME));
-    if (kept.length !== lines.length) {
-      const count = lines.length - kept.length;
-      if (options.dryRun) {
-        console.log(`  [dry-run] would remove ${count} ${STALE_COMBO_DIRNAME} entries from config.yml`);
-      } else {
-        await fs.writeFile(configPath, kept.join("\n"), "utf8");
-        console.log(`  [write] Removed ${count} ${STALE_COMBO_DIRNAME} entries from config.yml`);
-      }
-    }
-  }
+    return kept.length === lines.length ? null : kept;
+  }, {
+    dryRun: options.dryRun,
+    dryRunMessage: (removed) => `would remove ${removed} ${STALE_COMBO_DIRNAME} entries from config.yml`,
+    writeMessage: (removed) => `Removed ${removed} ${STALE_COMBO_DIRNAME} entries from config.yml`,
+  });
 
   const src = await readIfExists(TOKEN_SAVER_INDEX);
   if (!src) {
@@ -836,14 +852,21 @@ async function stepTokenSaverConfig(options = {}) {
   await writeIfChanged(configPath, `${JSON.stringify({ version: 2, preset }, null, 2)}\n`, options);
 }
 
-async function stepAmanaiReward(extDir, options = {}) {
+async function stepAmanaiReward(extDir, sources, options = {}) {
   stepHeader("Installing Amanai reward detector...");
-  const src = await readIfExists(AMANAI_REWARD_INDEX);
-  if (!src) {
+  if (!sources.amanaiReward) {
     console.log("  [skip] amanai-reward/index.js not found in repo");
     return;
   }
-  await writeIfChanged(path.join(extDir, "amanai-reward", "index.js"), src, options);
+  await writeIfChanged(path.join(extDir, "amanai-reward", "index.js"), sources.amanaiReward, options);
+
+  // package.json declares pi.js as the package's second entry point; copying only index.js left that
+  // declared entry pointing at a file the install never wrote.
+  if (!sources.amanaiRewardPi) {
+    console.log("  [skip] amanai-reward/pi.js not found in repo");
+    return;
+  }
+  await writeIfChanged(path.join(extDir, "amanai-reward", "pi.js"), sources.amanaiRewardPi, options);
 }
 
 // --- Doctor ---
@@ -851,19 +874,27 @@ async function stepAmanaiReward(extDir, options = {}) {
 async function runDoctor() {
   console.log("\n=== OMP Supreme Token Saver Doctor ===\n");
 
+  // Doctor has to gate CI, so every row that is expected to be ok/installed and is not counts as a
+  // failure. Informational rows (Home, versions, the optional Headroom tool) pass no flag.
+  let failed = 0;
+  const check = (text, ok = true) => {
+    if (!ok) failed += 1;
+    console.log(`  ${text}`);
+  };
+
   // Node
-  console.log(`  Node: ok ${process.version}`);
+  check(`Node: ok ${process.version}`);
 
   // OMP CLI
   try {
     const v = (await execCli("omp", ["--version"])).stdout.trim();
-    console.log(`  OMP CLI: ok ${v}`);
+    check(`OMP CLI: ok ${v}`);
   } catch {
-    console.log("  OMP CLI: MISSING");
+    check("OMP CLI: MISSING", false);
   }
 
   // Home
-  console.log(`  Home: ${HOME}`);
+  check(`Home: ${HOME}`);
 
   // Directories
   const agentDir = path.join(HOME, ".omp", "agent");
@@ -872,33 +903,34 @@ async function runDoctor() {
   const pluginsDir = path.join(HOME, ".omp", "plugins");
   const rtkBin = path.join(HOME, ".bun", "bin", IS_WINDOWS ? "rtk.exe" : "rtk");
 
-  const agentOk = await readIfExists(agentDir) !== null || (await fs.readdir(agentDir).catch(() => null)) !== null;
-  console.log(`  OMP agent dir: ${agentOk ? "ok" : "MISSING"} ${agentDir}`);
+  // readIfExists only reads files and throws on a directory, so readdir is the probe that works.
+  const agentOk = (await fs.readdir(agentDir).catch(() => null)) !== null;
+  check(`OMP agent dir: ${agentOk ? "ok" : "MISSING"} ${agentDir}`, agentOk);
 
   const extOk = (await fs.readdir(extDir).catch(() => null)) !== null;
-  console.log(`  OMP extensions dir: ${extOk ? "ok" : "MISSING"} ${extDir}`);
+  check(`OMP extensions dir: ${extOk ? "ok" : "MISSING"} ${extDir}`, extOk);
 
-  const sharedState = path.join(extDir, "shared", "session-state.js");
-  console.log(`  Shared session bridge: ${(await readIfExists(sharedState)) !== null ? "installed" : "MISSING"}`);
+  const sharedStateOk = (await readIfExists(path.join(extDir, "shared", "session-state.js"))) !== null;
+  check(`Shared session bridge: ${sharedStateOk ? "installed" : "MISSING"}`, sharedStateOk);
 
-  const sharedStatus = path.join(extDir, "shared", "status-line.js");
-  console.log(`  Unified status line: ${(await readIfExists(sharedStatus)) !== null ? "installed" : "MISSING"}`);
+  const sharedStatusOk = (await readIfExists(path.join(extDir, "shared", "status-line.js"))) !== null;
+  check(`Unified status line: ${sharedStatusOk ? "installed" : "MISSING"}`, sharedStatusOk);
 
-  const configOk = (await readIfExists(configPath)) !== null;
-  console.log(`  OMP config.yml: ${configOk ? "ok" : "MISSING"} ${configPath}`);
+  // Read once: the config.yml checks below used to re-read the same file two more times.
+  const configText = await readIfExists(configPath);
+  check(`OMP config.yml: ${configText !== null ? "ok" : "MISSING"} ${configPath}`, configText !== null);
 
   // Ponytail
   const ponytailPkg = path.join(pluginsDir, "node_modules", "@dietrichgebert", "ponytail", "package.json");
   const ponytailExt = path.join(pluginsDir, "node_modules", "@dietrichgebert", "ponytail", "pi-extension", "index.js");
   const ponytailInstalled = (await readIfExists(ponytailPkg)) !== null;
   const ponytailExtInstalled = (await readIfExists(ponytailExt)) !== null;
-  console.log(`  Ponytail package: ${ponytailInstalled ? "installed" : "MISSING"}`);
-  console.log(`  Ponytail extension: ${ponytailExtInstalled ? "installed" : "MISSING"}`);
+  check(`Ponytail package: ${ponytailInstalled ? "installed" : "MISSING"}`, ponytailInstalled);
+  check(`Ponytail extension: ${ponytailExtInstalled ? "installed" : "MISSING"}`, ponytailExtInstalled);
 
-  if (configOk) {
-    const configText = await readIfExists(configPath);
+  if (configText !== null) {
     const hasPonytailPath = configText.includes("ponytail") && configText.includes("pi-extension");
-    console.log(`  Ponytail in config.yml: ${hasPonytailPath ? "registered" : "MISSING"}`);
+    check(`Ponytail in config.yml: ${hasPonytailPath ? "registered" : "MISSING"}`, hasPonytailPath);
   }
 
   const ponytailConfigPath = path.join(ponytailConfigDir(), "config.json");
@@ -912,20 +944,20 @@ async function runDoctor() {
     }
     const row = parsed?.hideStatus === true ? "hidden (unified row)" : "visible (duplicate row)";
     const toast = parsed?.quietStartup === true ? "quiet" : "visible (startup toast)";
-    console.log(`  Ponytail config: ok defaultMode=${parsed?.defaultMode ?? "?"}, status row ${row}, startup toast ${toast}`);
+    check(`Ponytail config: ok defaultMode=${parsed?.defaultMode ?? "?"}, status row ${row}, startup toast ${toast}`);
   } else {
-    console.log(`  Ponytail config: MISSING ${ponytailConfigPath}`);
+    check(`Ponytail config: MISSING ${ponytailConfigPath}`, false);
   }
 
   // RTK
   const rtkExists = (await readIfExists(rtkBin)) !== null;
-  console.log(`  RTK binary: ${rtkExists ? "installed" : "MISSING"} ${rtkBin}`);
+  check(`RTK binary: ${rtkExists ? "installed" : "MISSING"} ${rtkBin}`, rtkExists);
   if (rtkExists) {
     try {
       const v = (await execP(rtkBin, ["--version"], { timeout: 5000 })).stdout.trim();
-      console.log(`  RTK version: ${v}`);
+      check(`RTK version: ${v}`);
     } catch {
-      console.log("  RTK version: unavailable (may not be executable)");
+      check("RTK version: unavailable (may not be executable)");
     }
   }
 
@@ -938,14 +970,14 @@ async function runDoctor() {
       .slice(0, 6)
       .join("\n")
       .trimEnd();
-    console.log("  rtk self-report: RTK's numbers are self-reported by the rtk binary, not independently verified.");
+    check("rtk self-report: RTK's numbers are self-reported by the rtk binary, not independently verified.");
     for (const line of gain.split("\n")) console.log(`    ${line}`);
   } catch (e) {
-    console.log(`  rtk self-report: unavailable (${e.message.split("\n")[0]})`);
+    check(`rtk self-report: unavailable (${e.message.split("\n")[0]})`);
   }
 
   // Headroom is an OPTIONAL external tool: this pack never bundles, installs, or depends on it, so a
-  // missing CLI is reported and the doctor still exits 0. The path comes from the platform's own PATH
+  // missing CLI is reported without failing the run. The path comes from the platform's own PATH
   // resolver (where / command -v) run through execCli — the same shell lookup the installer already
   // relies on for `omp` — rather than a second resolver in JS.
   try {
@@ -953,33 +985,34 @@ async function runDoctor() {
     const exe = await execCli(IS_WINDOWS ? "where" : "sh", IS_WINDOWS ? ["headroom"] : ["-c", "command -v headroom"], { timeout: 5000 })
       .then((r) => r.stdout.split(/\r?\n/)[0].trim())
       .catch(() => "");
-    console.log(`  Headroom: ok ${version}${exe ? ` ${exe}` : ""}`);
+    check(`Headroom: ok ${version}${exe ? ` ${exe}` : ""}`);
   } catch {
-    console.log("  Headroom: not installed (optional)");
+    check("Headroom: not installed (optional)");
   }
 
   const modelsYml = path.join(agentDir, "models.yml");
   const modelsYmlText = await readIfExists(modelsYml);
-  console.log(`  Headroom wrap: ${modelsYmlText !== null && /headroom/i.test(modelsYmlText) ? "wrapped (models.yml anthropic baseUrl)" : "not wrapped"}`);
+  check(`Headroom wrap: ${modelsYmlText !== null && /headroom/i.test(modelsYmlText) ? "wrapped (models.yml anthropic baseUrl)" : "not wrapped"}`);
   console.log("    `headroom wrap omp` only redirects the anthropic provider — other providers keep their endpoints.");
 
   // Caveman
-  const cavemanIndex = path.join(extDir, "caveman-session", "index.js");
-  const cavemanRule = path.join(extDir, "caveman-session", "rule.md");
-  console.log(`  Caveman extension: ${(await readIfExists(cavemanIndex)) !== null ? "installed" : "MISSING"}`);
-  console.log(`  Caveman rule.md: ${(await readIfExists(cavemanRule)) !== null ? "installed" : "MISSING"}`);
+  const cavemanIndexOk = (await readIfExists(path.join(extDir, "caveman-session", "index.js"))) !== null;
+  check(`Caveman extension: ${cavemanIndexOk ? "installed" : "MISSING"}`, cavemanIndexOk);
+
+  const cavemanRuleOk = (await readIfExists(path.join(extDir, "caveman-session", "rule.md"))) !== null;
+  check(`Caveman rule.md: ${cavemanRuleOk ? "installed" : "MISSING"}`, cavemanRuleOk);
 
   // RTK extension
-  const rtkIndex = path.join(extDir, "rtk-session", "index.js");
-  console.log(`  RTK extension: ${(await readIfExists(rtkIndex)) !== null ? "installed" : "MISSING"}`);
+  const rtkIndexOk = (await readIfExists(path.join(extDir, "rtk-session", "index.js"))) !== null;
+  check(`RTK extension: ${rtkIndexOk ? "installed" : "MISSING"}`, rtkIndexOk);
 
   // Updater
-  const updaterIndex = path.join(extDir, "ai-addons-updater", "index.js");
-  console.log(`  Updater extension: ${(await readIfExists(updaterIndex)) !== null ? "installed" : "MISSING"}`);
+  const updaterOk = (await readIfExists(path.join(extDir, "ai-addons-updater", "index.js"))) !== null;
+  check(`Updater extension: ${updaterOk ? "installed" : "MISSING"}`, updaterOk);
 
   // Token Saver extension (owns the session knobs and the /token-saver command surface)
-  const tokenSaverIndex = path.join(extDir, "token-saver", "index.js");
-  console.log(`  Token Saver extension: ${(await readIfExists(tokenSaverIndex)) !== null ? "installed" : "MISSING"}`);
+  const tokenSaverOk = (await readIfExists(path.join(extDir, "token-saver", "index.js"))) !== null;
+  check(`Token Saver extension: ${tokenSaverOk ? "installed" : "MISSING"}`, tokenSaverOk);
 
   const tokenSaverConfig = tokenSaverConfigPath();
   const tokenSaverRaw = await readIfExists(tokenSaverConfig);
@@ -990,30 +1023,37 @@ async function runDoctor() {
     } catch {
       preset = `unreadable`;
     }
-    console.log(`  Token Saver config: ok preset=${preset} ${tokenSaverConfig}`);
+    check(`Token Saver config: ok preset=${preset} ${tokenSaverConfig}`);
   } else {
-    console.log(`  Token Saver config: MISSING (sessions fall back to ${DEFAULT_PRESET}) ${tokenSaverConfig}`);
+    check(`Token Saver config: MISSING (sessions fall back to ${DEFAULT_PRESET}) ${tokenSaverConfig}`, false);
   }
 
   // Pre-2.0 leftovers: the stale directory registers a duplicate /combo command.
   const staleComboDir = path.join(extDir, STALE_COMBO_DIRNAME);
-  console.log(`  ${STALE_COMBO_DIRNAME} (pre-2.0): ${(await dirExists(staleComboDir)) ? `STALE ${staleComboDir}` : "ok absent"}`);
+  const noStaleCombo = !(await dirExists(staleComboDir));
+  check(`${STALE_COMBO_DIRNAME} (pre-2.0): ${noStaleCombo ? "ok absent" : `STALE ${staleComboDir}`}`, noStaleCombo);
 
-  const modeReinforcement = path.join(extDir, "shared", "mode-reinforcement.js");
-  console.log(`  Mode reinforcement extension: ${(await readIfExists(modeReinforcement)) !== null ? "installed" : "MISSING"}`);
+  const modeReinforcementOk = (await readIfExists(path.join(extDir, "shared", "mode-reinforcement.js"))) !== null;
+  check(`Mode reinforcement extension: ${modeReinforcementOk ? "installed" : "MISSING"}`, modeReinforcementOk);
 
   // Amanai reward detector
-  const amanaiRewardIndex = path.join(extDir, "amanai-reward", "index.js");
-  console.log(`  Amanai reward detector: ${(await readIfExists(amanaiRewardIndex)) !== null ? "installed" : "MISSING"}`);
+  const amanaiRewardOk = (await readIfExists(path.join(extDir, "amanai-reward", "index.js"))) !== null;
+  check(`Amanai reward detector: ${amanaiRewardOk ? "installed" : "MISSING"}`, amanaiRewardOk);
 
-  if (configOk) {
-    const configText = await readIfExists(configPath);
+  if (configText !== null) {
     const hasTokenSaverPath = configText.includes("token-saver");
-    console.log(`  Token Saver in config.yml: ${hasTokenSaverPath ? "registered" : "MISSING"}`);
+    check(`Token Saver in config.yml: ${hasTokenSaverPath ? "registered" : "MISSING"}`, hasTokenSaverPath);
     if (configText.includes(STALE_COMBO_DIRNAME)) {
-      console.log(`  [warn] config.yml still lists ${STALE_COMBO_DIRNAME} — rerun: install --yes`);
+      check(`[warn] config.yml still lists ${STALE_COMBO_DIRNAME} — rerun: install --yes`, false);
     }
   }
+
+  if (failed > 0) {
+    console.log(`\n${failed} check(s) failed — see the MISSING/STALE rows above.`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log("\nAll checks passed.");
 }
 
 // --- Uninstall ---
@@ -1023,21 +1063,46 @@ async function runUninstall(options = {}) {
   const shouldRemovePonytail = options.removePonytail ?? removePonytail;
   const shouldRemoveRtk = options.removeRtk ?? removeRtk;
   const shouldDryRun = options.dryRun ?? dryRun;
+  // A bare `uninstall` claims to remove the managed extensions, so it takes both scopes; `reinstall`
+  // passes the scope it is about to rewrite.
+  const scope = options.scope ?? scopeFlag ?? "both";
+  if (!SCOPE_CODES[scope]) {
+    console.error(`[fail] Invalid --scope: ${scope}. Use: user, project, both`);
+    process.exitCode = 1;
+    return;
+  }
+  const removesUserScope = scope === "user" || scope === "both";
+  const removesProjectScope = scope === "project" || scope === "both";
 
   console.log("\n=== OMP Supreme Token Saver Uninstall ===\n");
 
   const extDir = path.join(HOME, ".omp", "agent", "extensions");
   const configPath = path.join(HOME, ".omp", "agent", "config.yml");
   const rtkBin = path.join(HOME, ".bun", "bin", IS_WINDOWS ? "rtk.exe" : "rtk");
+  const projectExtDir = path.join(process.cwd(), ".omp", "extensions");
 
   const targets = [
-    path.join(extDir, "caveman-session"),
-    path.join(extDir, "rtk-session"),
-    path.join(extDir, "token-saver"),
-    path.join(extDir, "ai-addons-updater"),
-    path.join(extDir, STALE_COMBO_DIRNAME),
-    path.join(extDir, "shared"),
-    path.join(extDir, "amanai-reward"),
+    ...(removesUserScope ? [
+      // writeIfChanged leaves `<file>.bak` beside every file it replaces. The ones under the
+      // extension directories leave with them; these two do not, so uninstall names them itself.
+      path.join(extDir, "caveman-session"),
+      path.join(extDir, "rtk-session"),
+      path.join(extDir, "token-saver"),
+      path.join(extDir, "ai-addons-updater"),
+      path.join(extDir, STALE_COMBO_DIRNAME),
+      path.join(extDir, "shared"),
+      path.join(extDir, "amanai-reward"),
+      `${tokenSaverConfigPath()}.bak`,
+      path.join(HOME, ".omp", "plugins", "package.json.bak"),
+    ] : []),
+    ...(removesProjectScope ? [
+      // `--scope project` mirrors four of those under the CWD; uninstall has to name them too or a
+      // project install survives the removal that claimed to take the managed extensions away.
+      path.join(projectExtDir, "caveman-session"),
+      path.join(projectExtDir, "rtk-session"),
+      path.join(projectExtDir, "shared"),
+      path.join(projectExtDir, "amanai-reward"),
+    ] : []),
   ];
 
   console.log("Will remove:");
@@ -1054,7 +1119,7 @@ async function runUninstall(options = {}) {
     if (!answer.toLowerCase().startsWith("y")) {
       console.log("Aborted.");
       closeRL();
-      return false;
+      return;
     }
   }
 
@@ -1071,24 +1136,22 @@ async function runUninstall(options = {}) {
     }
   }
 
-  // Remove the token-saver registration (plus any pre-2.0 combo leftover) and
-  // mode-reinforcement; Ponytail only when requested.
-  const configRaw = await readIfExists(configPath);
-  if (configRaw) {
-    let lines = configRaw.split("\n");
-    const before = lines.length;
-    lines = lines.filter((l) => {
-      if (l.includes("token-saver") || l.includes(STALE_COMBO_DIRNAME) || l.includes("mode-reinforcement")) return false;
-      if (shouldRemovePonytail && l.includes("ponytail") && l.includes("pi-extension")) return false;
-      return true;
+  // Remove the token-saver registration (plus any pre-2.0 combo leftover) and mode-reinforcement;
+  // Ponytail only when requested. A project-scope install never wrote these entries, so a
+  // project-only uninstall leaves the user's config.yml alone.
+  if (removesUserScope) {
+    await rewriteConfigLines(configPath, (lines) => {
+      const kept = lines.filter((l) => {
+        if (l.includes("token-saver") || l.includes(STALE_COMBO_DIRNAME) || l.includes("mode-reinforcement")) return false;
+        if (shouldRemovePonytail && l.includes("ponytail") && l.includes("pi-extension")) return false;
+        return true;
+      });
+      return kept.length === lines.length ? null : kept;
+    }, {
+      dryRun: shouldDryRun,
+      dryRunMessage: (removed) => `would remove ${removed} config.yml entries`,
+      writeMessage: (removed) => `Updated config.yml (removed ${removed} entries)`,
     });
-    if (lines.length !== before) {
-      if (shouldDryRun) console.log(`  [dry-run] would remove ${before - lines.length} config.yml entries`);
-      else {
-        await fs.writeFile(configPath, lines.join("\n"), "utf8");
-        console.log(`  [write] Updated config.yml (removed ${before - lines.length} entries)`);
-      }
-    }
   }
 
   // Remove RTK binary if requested
@@ -1105,7 +1168,6 @@ async function runUninstall(options = {}) {
   }
 
   console.log("\nDone. Restart OMP for changes to take effect.");
-  return true;
 }
 
 async function runLatestUpdate() {
@@ -1211,6 +1273,25 @@ async function main() {
     return;
   }
 
+  // Validated here, before the uninstall/reinstall branches: those run before the scope resolution
+  // below, and an invalid scope has to stop them, not silently fall back to user scope.
+  if (scopeFlag && !SCOPE_CODES[scopeFlag]) {
+    console.error(`[fail] Invalid --scope: ${scopeFlag}. Use: user, project, both`);
+    process.exitCode = 1;
+    closeRL();
+    return;
+  }
+
+  // Every install target is built from HOME. Without it they would silently become CWD-relative
+  // paths (`.omp/agent/...`), so this has to stop before the first step runs.
+  if (!HOME) {
+    console.error("[fail] Neither HOME nor USERPROFILE is set — no install location to write to.");
+    console.error("[hint] Set HOME (or USERPROFILE on Windows) and re-run the installer.");
+    process.exitCode = 1;
+    closeRL();
+    return;
+  }
+
   if (doctor) {
     await runDoctor();
     closeRL();
@@ -1224,7 +1305,10 @@ async function main() {
   }
 
   if (reinstall) {
-    await runUninstall({ yes: true, removePonytail: false, removeRtk: true });
+    // Matches the install default when --scope is absent; an explicit --scope is honoured here and
+    // again below, so `reinstall --scope project|both` no longer cleans user scope and then
+    // reinstalls user scope anyway.
+    await runUninstall({ yes: true, removePonytail: false, removeRtk: true, scope: scopeFlag || "user" });
   }
 
   if (dryRun) console.log("[dry-run] No changes will be written.\n");
@@ -1234,20 +1318,14 @@ async function main() {
   console.log(`  Arch: ${process.arch}`);
   console.log(`  Home: ${HOME}`);
 
-  // Determine install scope
+  // Determine install scope. scopeFlag was validated above, so the map cannot come back empty here.
   let scope;
-  if (reinstall) {
-    scope = "1";
+  if (scopeFlag) {
+    scope = SCOPE_CODES[scopeFlag];
+    console.log(`  Scope: ${scopeFlag}${reinstall ? " (reinstall)" : ""}`);
+  } else if (reinstall) {
+    scope = SCOPE_CODES.user;
     console.log("  Scope: user (reinstall)");
-  } else if (scopeFlag) {
-    const map = { user: "1", project: "2", both: "3" };
-    scope = map[scopeFlag];
-    if (!scope) {
-      console.log(`  [fail] Invalid --scope: ${scopeFlag}. Use: user, project, both`);
-      closeRL();
-      process.exit(1);
-    }
-    console.log(`  Scope: ${scopeFlag}`);
   } else if (install || yes) {
     scope = "1";
     console.log(`  Scope: user (${install ? "install default" : "--scope omitted, defaulting to user with --yes"})`);
@@ -1265,7 +1343,9 @@ async function main() {
   const bunBinDir = path.join(HOME, ".bun", "bin");
   const projectExtDir = path.join(process.cwd(), ".omp", "extensions");
 
-  const options = { dryRun, verbose, yes, scope, reinstall, preset: presetFlag, forcePreset };
+  // verbose/yes/scope are read as module-level flags, not off this object; only the values the steps
+  // and the uninstall/reinstall paths actually look up live here.
+  const options = { dryRun, reinstall, preset: presetFlag, forcePreset };
 
   // Check prerequisites
   console.log("\nPrerequisites:");
@@ -1276,28 +1356,50 @@ async function main() {
     console.log("  [fail] omp not found — ensure it's installed");
   }
 
+  // The repo files and the remote Caveman rule are the same for both scopes: read/fetch them once
+  // here instead of re-reading them for whichever scope runs second under `--scope both`.
+  const sources = {
+    sessionState: await readIfExists(SHARED_SESSION_STATE),
+    statusLine: await readIfExists(SHARED_STATUS_LINE),
+    rtkSession: await readIfExists(RTK_SESSION_INDEX),
+    cavemanRule: await readIfExists(path.join(path.dirname(CAVEMAN_INDEX), "rule.md")) || "",
+    cavemanIndex: await readIfExists(CAVEMAN_INDEX),
+    updater: await readIfExists(UPDATER_INDEX),
+    amanaiReward: await readIfExists(AMANAI_REWARD_INDEX),
+    amanaiRewardPi: await readIfExists(AMANAI_REWARD_PI),
+  };
+  // A dry run stays offline. The bundled rule is always a valid destination, so a failed fetch falls
+  // back to it instead of aborting the install with the remaining steps unrun.
+  if (!dryRun) {
+    try {
+      sources.cavemanRule = await httpsGet(CAVEMAN_REMOTE_RULE) || sources.cavemanRule;
+    } catch (e) {
+      console.log(`  [warn] Could not fetch ${CAVEMAN_REMOTE_RULE} (${e.message}) — using the bundled rule`);
+    }
+  }
+
   // Install per scope. User scope plays eight steps, project scope replays four of them, and the
   // defaults step closes every run — stepTotal has to match the blocks that actually execute.
   stepTotal = (scope === "1" || scope === "3" ? 8 : 0) + (scope === "2" || scope === "3" ? 4 : 0) + 1;
   if (scope === "1" || scope === "3") {
     console.log("\n--- User-level install ---");
-    await stepSharedSessionState(userExtDir, options);
+    await stepSharedSessionState(userExtDir, sources, options);
     await stepPonytail(userPluginsDir, userDir, options);
     const ponytailExtPath = path.join(userPluginsDir, "node_modules", "@dietrichgebert", "ponytail", "pi-extension", "index.js");
     await stepRtk(bunBinDir, options);
-    await stepRtkSession(userExtDir, options);
-    await stepCaveman(userExtDir, options);
+    await stepRtkSession(userExtDir, sources, options);
+    await stepCaveman(userExtDir, sources, options);
     await stepTokenSaver(userExtDir, options);
     await stepModeReinforcement(userExtDir, ponytailExtPath, options);
-    await stepAmanaiReward(userExtDir, options);
+    await stepAmanaiReward(userExtDir, sources, options);
   }
 
   if (scope === "2" || scope === "3") {
     console.log("\n--- Project-level install ---");
-    await stepSharedSessionState(projectExtDir, options);
-    await stepRtkSession(projectExtDir, options);
-    await stepCaveman(projectExtDir, options);
-    await stepAmanaiReward(projectExtDir, options);
+    await stepSharedSessionState(projectExtDir, sources, options);
+    await stepRtkSession(projectExtDir, sources, options);
+    await stepCaveman(projectExtDir, sources, options);
+    await stepAmanaiReward(projectExtDir, sources, options);
     console.log("  [note] Token Saver, Ponytail, and the RTK binary are user-level (global) installs");
   }
 

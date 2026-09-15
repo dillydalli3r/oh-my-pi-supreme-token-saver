@@ -1,4 +1,4 @@
-// Contract: the pack renders exactly one status row (key `modes`) whose seven knob segments are
+// Contract: the pack renders exactly one status row (key `modes`) whose nine knob segments are
 // byte-identical no matter which command set them, `/ts` is the only writer of what a new session
 // starts from, mode instructions reach subagents exactly once per mode set, and no extension
 // rewrites message history or tool output.
@@ -19,12 +19,15 @@ const CONFIG_FILE = join(SANDBOX, "token-saver.json");
 const LEGACY_DEFAULTS_FILE = join(SANDBOX, "combo-defaults.json");
 const PONYTAIL_DIR = join(SANDBOX, "ponytail");
 const PONYTAIL_STUB = join(PONYTAIL_DIR, "stub-default.json");
+// The headroom wrap state is written next to the pack's config; same sandbox rule.
+const HEADROOM_STATE = join(SANDBOX, "headroom.json");
 // A directory that does not exist: what a user without the plugin installed looks like.
 const ABSENT_PONYTAIL_DIR = join(SANDBOX, "no-ponytail");
 
 process.env.OMP_TOKEN_SAVER_CONFIG = CONFIG_FILE;
 process.env.OMP_COMBO_DEFAULTS_FILE = LEGACY_DEFAULTS_FILE;
 process.env.OMP_PONYTAIL_PACKAGE_DIR = PONYTAIL_DIR;
+process.env.OMP_HEADROOM_STATE = HEADROOM_STATE;
 
 // The ponytail plugin owns its own default (its command writes this module), so the stub stands in
 // for the real one rather than for one of our modules.
@@ -47,7 +50,7 @@ after(() => rmSync(SANDBOX, { recursive: true, force: true }));
 
 // Both files mean "a stored default"; a test that wants the built-in defaults starts by deleting them.
 const clearSandboxFiles = () => {
-  for (const file of [CONFIG_FILE, LEGACY_DEFAULTS_FILE, PONYTAIL_STUB]) rmSync(file, { force: true });
+  for (const file of [CONFIG_FILE, LEGACY_DEFAULTS_FILE, PONYTAIL_STUB, HEADROOM_STATE]) rmSync(file, { force: true });
 };
 
 beforeEach(clearSandboxFiles);
@@ -67,8 +70,11 @@ const withoutPonytailPlugin = async (run) => {
 const SUBAGENT_PROMPT = "You are operating on a piece of work assigned to you by the main agent.";
 const SUBAGENT_TAIL = "Do not weaken or disable a mode unless the main agent asks for it.";
 
-// The built-in default session, rendered: preset marker plus all seven knob segments.
-const MAX_ROW = "🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: FULL · 🔁 auto: ON";
+// The built-in default session, rendered: preset marker plus all nine knob segments.
+const MAX_ROW = "🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🔁 auto: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: FULL · ⏱️ threshold: FULL · 🔀 headroom: OFF";
+
+// One row segment per knob except `status`, which is the knob that picks the row's shape.
+const MODE_KNOB_COUNT = 9;
 
 const EXTENSION_FILES = [
   join(EXT, "caveman-session", "index.js"),
@@ -95,7 +101,7 @@ function zodStub() {
 // `sessionId` stands in for `ctx.sessionManager.getSessionId()`: the real OMP passes one, and a
 // second runtime in this process (the docs give a subagent its own) must not republish over the
 // first session's live state.
-async function createRuntime(branch = [], files = EXTENSION_FILES, { sessionId } = {}) {
+async function createRuntime(branch = [], files = EXTENSION_FILES, { sessionId, select, model } = {}) {
   const handlers = new Map();
   const commands = new Map();
   const status = new Map();
@@ -103,7 +109,17 @@ async function createRuntime(branch = [], files = EXTENSION_FILES, { sessionId }
   const intervals = [];
   const execCalls = [];
   const entries = [...branch];
-  let usage;
+  const providers = new Map();
+  // The session's live model: `pi.setModel(resolve(...))` is what re-points it, exactly as a real
+  // session holds a resolved Model rather than re-reading the registry per request.
+  let current = model ? { ...model } : undefined;
+  const resolve = (spec) => {
+    if (!model) return undefined;
+    if (spec !== `${model.provider}/${model.id}`) return undefined;
+    return { ...model, baseUrl: providers.get(model.provider)?.baseUrl ?? model.baseUrl };
+  };
+  const modelSwitches = [];
+  let thinkingLevel = "high";
   let execImpl = async () => ({ code: 0, stdout: "", stderr: "" });
 
   const pi = {
@@ -123,6 +139,25 @@ async function createRuntime(branch = [], files = EXTENSION_FILES, { sessionId }
     registerCommand(name, def) {
       commands.set(name, def);
     },
+    // `pi.registerProvider(id, {baseUrl})` is a runtime transport override in OMP: it outranks models.yml
+    // and the bundled catalog for that provider id, so `ctx.models.current()` reads it back.
+    registerProvider(name, config) {
+      providers.set(name, config);
+    },
+    unregisterProvider(name) {
+      providers.delete(name);
+    },
+    // A real session holds one resolved Model; switching it is what changes the endpoint the next
+    // request uses, so the stub tracks the switch instead of re-reading per call.
+    setModel: async (next) => {
+      current = { ...next };
+      modelSwitches.push(next.baseUrl);
+      return true;
+    },
+    getThinkingLevel: () => thinkingLevel,
+    setThinkingLevel: (level) => {
+      thinkingLevel = level;
+    },
     on(event, handler) {
       handlers.set(event, [...(handlers.get(event) || []), handler]);
     },
@@ -131,7 +166,9 @@ async function createRuntime(branch = [], files = EXTENSION_FILES, { sessionId }
   const ctx = {
     hasUI: true,
     cwd: process.cwd(),
-    getContextUsage: () => usage,
+    // The session's active model, with any runtime provider override applied — the same read-back a
+    // real session gets from the registry.
+    models: { current: () => (current ? { ...current } : undefined), resolve },
     ui: {
       // OMP deletes the key on `undefined` and keeps any other string, including "".
       setStatus: (key, text) => {
@@ -139,6 +176,9 @@ async function createRuntime(branch = [], files = EXTENSION_FILES, { sessionId }
         else status.set(key, text);
       },
       notify: (text, type) => notifications.push({ text, type }),
+      // `/ts config` is driven by selector answers; a test supplies the picks it wants chosen (a
+      // pick of `undefined` is the user pressing escape).
+      ...(select ? { select } : {}),
     },
     sessionManager: {
       getBranch: () => entries,
@@ -177,9 +217,7 @@ async function createRuntime(branch = [], files = EXTENSION_FILES, { sessionId }
     events: () => [...handlers.keys()],
     row: (key = "modes") => status.get(key),
     keys: () => [...status.keys()],
-    setUsage: (value) => {
-      usage = value;
-    },
+    modelSwitches: () => [...modelSwitches],
     setExec: (impl) => {
       execImpl = impl;
     },
@@ -206,13 +244,13 @@ async function createRuntime(branch = [], files = EXTENSION_FILES, { sessionId }
   };
 }
 
-test("a fresh session renders one row: the default preset with all seven knob segments", async () => {
+test("a fresh session renders one row: the default preset with every knob segment", async () => {
   const rt = await createRuntime();
   await rt.start();
 
   assert.deepEqual(rt.keys(), ["modes"], "the pack owns one status row");
   assert.equal(rt.row(), MAX_ROW);
-  assert.equal(segments(rt.row()).length, 8, "preset marker + seven knobs");
+  assert.equal(segments(rt.row()).length, MODE_KNOB_COUNT + 1, "preset marker + one segment per knob");
 });
 
 test("session start is silent: no add-on announces itself loading", async () => {
@@ -262,7 +300,7 @@ test("every invocation path renders the same row for the same knob values", asyn
 
   const liteKnobByKnob = await createRuntime();
   await liteKnobByKnob.start();
-  await liteKnobByKnob.run("ts", "set caveman=lite ponytail=lite read=off compress=lite prune=off");
+  await liteKnobByKnob.run("ts", "set caveman=lite ponytail=lite read=off compress=lite prune=off threshold=off");
   const liteKnobsRow = liteKnobByKnob.row();
 
   assert.match(liteRow, /^🧩 LITE · /);
@@ -280,7 +318,7 @@ test("a per-knob override changes only its segments, derives CUSTOM, and replays
 
   assert.equal(
     after,
-    "🧩 CUSTOM · 🦴 caveman: WENYAN · 🦀 rtk: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: OFF · 🔁 auto: ON"
+    "🧩 CUSTOM · 🦴 caveman: WENYAN · 🦀 rtk: ON · 🔁 auto: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: OFF · ⏱️ threshold: FULL · 🔀 headroom: OFF"
   );
   const changed = segments(after).filter((part, index) => part !== segments(before)[index]);
   assert.deepEqual(changed, ["🧩 CUSTOM", "🦴 caveman: WENYAN", "🧹 prune: OFF"]);
@@ -387,18 +425,41 @@ test("nothing is appended when every knob is off", async () => {
   assert.equal(prompt, SUBAGENT_PROMPT, "no mode is active, so no instruction is injected");
 });
 
-test("the meter renders the context usage it is handed", async () => {
+// Four row shapes, because a footer can be narrower than nine segments: `names` is the one that
+// says what each tool is set to without an icon to decode, `preset` is one word.
+test("the status knob picks the row's shape", async () => {
   const rt = await createRuntime();
   await rt.start();
 
-  rt.setUsage({ percent: 42 });
-  await rt.emit("turn_end", {});
-  assert.match(rt.row(), /👁 42% ctx/);
-  assert.match(rt.row(), /^🧩 MAX · /);
+  await rt.run("ts", "set status=names");
+  assert.equal(
+    rt.row(),
+    "🧩 MAX · caveman: ULTRA · rtk: ON · auto: ON · ponytail: ULTRA · read: FULL · compress: FULL · prune: FULL · threshold: FULL · headroom: OFF"
+  );
+  assert.equal(rt.row().includes("🦴"), false, "no icon is left to decode");
 
-  rt.setUsage(undefined);
-  await rt.emit("turn_end", {});
-  assert.equal(rt.row(), MAX_ROW, "no usage, no meter, no throw");
+  await rt.run("ts", "set status=preset");
+  assert.equal(rt.row(), "🧩 MAX");
+
+  await rt.run("ts", "set status=compact");
+  assert.equal(rt.row(), "🧩 MAX · 🦴U · 🦀ON · 🔁ON · 🐴U · 📖F · 🗜️F · 🧹F · ⏱️F · 🔀OFF");
+
+  await rt.run("ts", "set status=full");
+  assert.equal(rt.row(), MAX_ROW);
+});
+
+// A display-only knob must not demote the session: `custom` would also drop the preset's native tier
+// dials, so the row would report a different preset than the knobs the session actually runs.
+test("changing only the row's shape keeps the preset the session reports", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  await rt.run("ts", "preset ultra");
+  await rt.run("ts", "set status=full");
+
+  assert.match(rt.row(), /^🧩 ULTRA · /, "the knobs are still ultra's");
+  assert.match(rt.notifications.at(-1).text, /^Set status=full/);
+  assert.doesNotMatch(rt.notifications.at(-1).text, /custom/);
 });
 
 test("autoRtk off never spawns rtk and leaves the command alone", async () => {
@@ -591,7 +652,7 @@ test("/ts default reports the preset a fresh session actually renders", async ()
   // report has to come from the modes themselves.
   await rt.run(
     "ts",
-    "default caveman=lite rtk=on ponytail=lite read=off compress=lite prune=off autoRtk=on status=full"
+    "default caveman=lite rtk=on ponytail=lite read=off compress=lite prune=off threshold=off autoRtk=on status=full"
   );
   assert.match(rt.notifications.at(-1).text, /Default for new sessions: LITE/);
 
@@ -706,34 +767,66 @@ test("/combo keeps the pre-2.0 default verb and refuses the newer knobs", async 
 // provider, so these tests pin the report, the in-session-safe half and the two refusals.
 const headroomCall = (call) => [call.command, ...call.args].join(" ");
 
-test("/ts headroom reports the installed version and this session's provider", async () => {
-  const rt = await createRuntime();
+// The proxy is a real HTTP service; `/health` is the only thing the pack reads back from it, so the
+// probe is what the tests stand in for. A proxy that is up is the only case that skips spawning.
+const withProxyHealth = async (run, { ready = true, status = "healthy", config = {} } = {}) => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({ status, ready, version: "0.37.0", rust_core: "loaded", config }),
+  });
+  try {
+    return await run();
+  } finally {
+    globalThis.fetch = original;
+  }
+};
+
+const DEEPSEEK = { provider: "deepseek", id: "deepseek-flash", api: "openai-completions", baseUrl: "https://api.deepseek.com/v1" };
+const PROXY_8787 = "http://127.0.0.1:8787/v1";
+
+test("/ts headroom status names the proxy it found, that proxy's upstreams, and this session's routing", async () => {
+  const rt = await createRuntime([], EXTENSION_FILES, { model: DEEPSEEK });
   await rt.start();
   rt.setExec(async () => ({ code: 0, stdout: "headroom, version 0.37.0\n", stderr: "" }));
-
   rt.clearExecCalls();
-  await rt.run("ts", "headroom");
+
+  await withProxyHealth(() => rt.run("ts", "headroom"), {
+    config: { openai_api_url: "https://api.deepseek.com/v1" },
+  });
+
   const report = rt.notifications.at(-1);
   assert.equal(report.type, "info");
   assert.match(report.text, /Headroom: headroom, version 0\.37\.0/);
-  assert.match(report.text, /wrap omp/, "the external command is printed");
+  assert.match(report.text, /Proxy on 8787: up/);
+  assert.match(report.text, /openai_api_url=https:\/\/api\.deepseek\.com\/v1/, "what the proxy forwards to");
+  assert.match(report.text, /Routed through the proxy: no/, "a fresh session is not routed");
   assert.equal(rt.execCalls.length, 1, "one version probe");
   assert.match(headroomCall(rt.execCalls[0]), /headroom --version$/);
+});
 
-  // The alias surface reaches the same verb, and the provider line never claims a saving.
-  await rt.run("token-saver", "headroom status");
-  assert.match(rt.notifications.at(-1).text, /Headroom: headroom, version 0\.37\.0/);
-  assert.match(rt.notifications.at(-1).text, /Session provider: unknown/);
+test("/ts headroom status is honest about a proxy that is down and a family it cannot route", async () => {
+  const rt = await createRuntime([], EXTENSION_FILES, {
+    model: { provider: "bedrock", id: "claude-sonnet-4", api: "bedrock-converse-stream", baseUrl: "https://bedrock.example" },
+  });
+  await rt.start();
+  rt.setExec(async () => ({ code: 0, stdout: "headroom, version 0.37.0", stderr: "" }));
 
-  const openai = await createRuntime();
-  await openai.start();
-  openai.setExec(async () => ({ code: 0, stdout: "headroom, version 0.37.0", stderr: "" }));
-  openai.ctx.models = { current: () => ({ provider: "openai" }) };
-
-  await openai.run("ts", "headroom status");
-  const other = openai.notifications.at(-1);
-  assert.match(other.text, /Session provider: openai/);
-  assert.match(other.text, /a wrap changes nothing for this session/);
+  // Nothing is listening: the probe is stubbed to fail rather than to depend on the test machine
+  // having no proxy on 8787 (a developer running one should still get a deterministic suite).
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("ECONNREFUSED 127.0.0.1:8787");
+  };
+  try {
+    await rt.run("ts", "headroom status");
+  } finally {
+    globalThis.fetch = original;
+  }
+  const report = rt.notifications.at(-1);
+  assert.match(report.text, /Proxy on 8787: down/);
+  assert.match(report.text, /headroom has no upstream flag for this family/, "no invented support");
+  assert.doesNotMatch(report.text, /Routed through the proxy: yes/);
 });
 
 test("/ts headroom says not installed and prints the install line when the binary is absent", async () => {
@@ -754,40 +847,98 @@ test("/ts headroom says not installed and prints the install line when the binar
   assert.match(rt.notifications.at(-1).text, /Headroom: not installed/);
 });
 
-test("/ts headroom wrap refuses and spawns nothing", async () => {
-  const rt = await createRuntime();
+test("/ts headroom wrap routes this session's provider at the proxy, for any family", async () => {
+  const rt = await createRuntime([], EXTENSION_FILES, { model: DEEPSEEK });
   await rt.start();
-  rt.setExec(async () => {
-    throw new Error("wrap must not be spawned");
-  });
-  rt.clearExecCalls();
 
-  await rt.run("ts", "headroom wrap omp");
-  const refusal = rt.notifications.at(-1);
-  assert.equal(refusal.type, "warning");
-  assert.match(refusal.text, /nest omp inside omp/);
-  assert.match(refusal.text, /Run it from your own shell/);
-  assert.deepEqual(rt.execCalls, [], "no subprocess at all");
+  await withProxyHealth(() => rt.run("ts", "headroom wrap"), {
+    config: { openai_api_url: DEEPSEEK.baseUrl },
+  });
+
+  const done = rt.notifications.at(-1);
+  assert.equal(done.type, "info");
+  assert.match(done.text, /omp → http:\/\/127\.0\.0\.1:8787\/v1 → https:\/\/api\.deepseek\.com\/v1/);
+  assert.match(done.text, /Routing read back from the registry: yes/);
+  assert.deepEqual(rt.modelSwitches(), [PROXY_8787], "the session model was handed the proxied endpoint");
+  assert.equal(
+    rt.ctx.models.current().baseUrl,
+    PROXY_8787,
+    "the registry reports the proxy, which is what the next request uses"
+  );
+
+  // The anthropic family posts `<base>/v1/messages` itself, so its base carries no `/v1`.
+  const anthropic = await createRuntime([], EXTENSION_FILES, {
+    model: { provider: "anthropic", id: "claude-opus-4-5", api: "anthropic-messages", baseUrl: "https://api.anthropic.com" },
+  });
+  await anthropic.start();
+  await withProxyHealth(() => anthropic.run("ts", "headroom wrap"), {
+    config: { anthropic_api_url: "https://api.anthropic.com" },
+  });
+  assert.equal(anthropic.ctx.models.current().baseUrl, "http://127.0.0.1:8787");
 });
 
-test("/ts headroom unwrap runs `headroom unwrap omp` exactly once", async () => {
+test("/ts headroom wrap refuses a proxy pointed at another upstream, and a family with no flag", async () => {
+  const rt = await createRuntime([], EXTENSION_FILES, { model: DEEPSEEK });
+  await rt.start();
+  // Sending this session's traffic (and its API key) to someone else's upstream is the failure this
+  // guard exists for: the proxy on the port forwards openai traffic somewhere other than our provider.
+  await withProxyHealth(() => rt.run("ts", "headroom wrap"), {
+    config: { openai_api_url: "https://api.openai.com/v1" },
+  });
+
+  const refusal = rt.notifications.at(-1);
+  assert.equal(refusal.type, "warning");
+  assert.match(refusal.text, /already up on 8787 forwarding openai_api_url to https:\/\/api\.openai\.com\/v1/);
+  assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl, "nothing was rerouted");
+
+  const bedrock = await createRuntime([], EXTENSION_FILES, {
+    model: { provider: "bedrock", id: "claude-sonnet-4", api: "bedrock-converse-stream", baseUrl: "https://bedrock.example" },
+  });
+  await bedrock.start();
+  bedrock.ctx.models.current = () => ({ provider: "bedrock", api: "bedrock-converse-stream", baseUrl: "https://bedrock.example" });
+  await bedrock.run("ts", "headroom wrap");
+  const noFlag = bedrock.notifications.at(-1);
+  assert.equal(noFlag.type, "warning");
+  assert.match(noFlag.text, /no upstream flag for api "bedrock-converse-stream"/);
+});
+
+test("/ts headroom unwrap removes the routing the pack added", async () => {
+  const rt = await createRuntime([], EXTENSION_FILES, { model: DEEPSEEK });
+  await rt.start();
+  await withProxyHealth(() => rt.run("ts", "headroom wrap"), {
+    config: { openai_api_url: DEEPSEEK.baseUrl },
+  });
+  assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787);
+
+  await rt.run("ts", "headroom unwrap");
+  const done = rt.notifications.at(-1);
+  assert.equal(done.type, "info");
+  assert.match(done.text, /Routing removed for deepseek/);
+  assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl, "the provider is back on its own endpoint");
+  assert.equal(existsSync(HEADROOM_STATE), false, "the wrap state is gone, so a stale unwrap cannot fire");
+
+  // Nothing to undo is reported, not thrown.
+  await rt.run("ts", "headroom unwrap");
+  assert.match(rt.notifications.at(-1).text, /Nothing to unroute: deepseek is not pointed at a proxy/);
+});
+
+test("/ts headroom unwrap-models restores the file `headroom wrap omp` wrote", async () => {
   const rt = await createRuntime();
   await rt.start();
   rt.setExec(async () => ({ code: 0, stdout: "restored models.yml\n", stderr: "" }));
   rt.clearExecCalls();
 
-  await rt.run("ts", "headroom unwrap");
+  await rt.run("ts", "headroom unwrap-models");
   assert.equal(rt.execCalls.length, 1);
   assert.deepEqual(rt.execCalls[0].args.slice(-2), ["unwrap", "omp"]);
   const done = rt.notifications.at(-1);
-  assert.equal(done.type, "info");
   assert.match(done.text, /restored models\.yml/);
   assert.match(done.text, /models\.yml:/, "the file it rewrote is named");
 
   rt.setExec(async () => {
     throw new Error("spawn headroom ENOENT");
   });
-  await rt.run("ts", "headroom unwrap");
+  await rt.run("ts", "headroom unwrap-models");
   const failed = rt.notifications.at(-1);
   assert.equal(failed.type, "warning");
   assert.match(failed.text, /spawn headroom ENOENT/);
@@ -812,12 +963,17 @@ test("/combo refuses the headroom verb like the other non-preset verbs", async (
 
 // The knobs select OMP's own settings, so these tests read back the `omp config set` calls the
 // extension makes rather than our tables: a stub `omp` reports config.yml and records the writes.
+// The pack passes `--json` alongside every `config set`, and puts the `--` separator in front of a
+// value that starts with `-`, so the value is the first argument after the key that is neither of
+// those flags.
+const setValue = (args, at) => args.slice(at + 2).find((arg) => arg !== "--json" && arg !== "--");
+
 const nativeWrites = (rt) =>
   rt.execCalls
     .filter((call) => call.args.includes("set") && call.args.includes("config"))
     .map((call) => {
       const at = call.args.indexOf("set");
-      return `${call.args[at + 1]}=${call.args[at + 2]}`;
+      return `${call.args[at + 1]}=${setValue(call.args, at)}`;
     });
 
 const stale = (value) => (value === "true" ? true : value === "false" ? false : Number.isNaN(Number(value)) ? value : Number(value));
@@ -833,7 +989,7 @@ const stubOmp = (rt, values = {}) => {
     }
     if (argv.includes("config set")) {
       const at = args.indexOf("set");
-      stored.set(args[at + 1], stale(args[at + 2]));
+      stored.set(args[at + 1], stale(setValue(args, at)));
       return { code: 0, stdout: "{}", stderr: "" };
     }
     return { code: 0, stdout: "{}", stderr: "" };
@@ -900,6 +1056,86 @@ test("the compress knob alone picks the spill keys, so ultra and medium differ",
   }
 });
 
+test("the threshold knob's level picks the compaction trigger keys", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  stubOmp(rt);
+  await rt.run("ts", "native on");
+
+  await rt.run("ts", "set threshold=ultra");
+  const ultra = nativeWrites(rt);
+  assert.ok(ultra.includes("compaction.thresholdPercent=55"), ultra.join(" "));
+  assert.ok(ultra.includes("compaction.idleEnabled=true"));
+  assert.ok(ultra.includes("compaction.idleThresholdTokens=80000"));
+
+  rt.clearExecCalls();
+  await rt.run("ts", "set threshold=off");
+  const off = nativeWrites(rt);
+  assert.ok(off.includes("compaction.thresholdPercent=-1"), off.join(" "));
+  assert.ok(off.includes("compaction.idleEnabled=false"));
+  assert.ok(off.includes("compaction.idleThresholdTokens=200000"));
+
+  // `-1` is only accepted after `--`: without the separator the host CLI refuses the write as an
+  // unknown option and nothing lands, so the argv itself is the pin, not the mapped pair. The
+  // `--json` flag has to come before the separator for the same reason — anything after `--` is
+  // positional, so trailing it there would be read as part of the value (`Invalid number: -1 --json`).
+  const percent = rt.execCalls.find((call) => call.args.includes("compaction.thresholdPercent"));
+  const at = percent.args.indexOf("config");
+  assert.deepEqual(percent.args.slice(at, at + 6), ["config", "set", "compaction.thresholdPercent", "--json", "--", "-1"]);
+});
+
+// `prune` used to switch idle compaction on while the token trigger stayed at its 200000 default —
+// at or above the whole window of many models, so the setting could never fire. The trigger family
+// belongs to `threshold` alone now, and this pins that prune writes none of it. The native gate is
+// left off, so the knob change itself writes nothing and the apply is what turns the mapping into
+// writes.
+test("the prune knob no longer claims idle compaction", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  // The session holds threshold=off, which is exactly what the stub already has, so those trigger
+  // keys are never pending and the assertion below is about prune alone.
+  stubOmp(rt, {
+    "compaction.thresholdPercent": -1,
+    "compaction.idleEnabled": false,
+    "compaction.idleThresholdTokens": 200000,
+  });
+
+  await rt.run("ts", "set threshold=off prune=ultra");
+  rt.clearExecCalls();
+  await rt.run("ts", "native apply");
+
+  const called = nativeWrites(rt);
+  assert.ok(called.includes("compaction.supersedeReads=true"), called.join(" "));
+  assert.ok(called.includes("compaction.dropUseless=true"));
+  assert.ok(called.includes("compaction.keepRecentTokens=8000"));
+  assert.deepEqual(called.filter((key) => key.startsWith("compaction.idle")), [], called.join(" "));
+});
+
+test("a preset carries the threshold level", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  stubOmp(rt);
+  await rt.run("ts", "native on");
+
+  await rt.run("ts", "preset max");
+  const max = nativeWrites(rt);
+  assert.ok(max.includes("compaction.thresholdPercent=70"), max.join(" "));
+  assert.ok(max.includes("compaction.idleThresholdTokens=120000"));
+
+  rt.clearExecCalls();
+  await rt.run("ts", "preset ultra");
+  const ultra = nativeWrites(rt);
+  assert.ok(ultra.includes("compaction.thresholdPercent=55"), ultra.join(" "));
+  assert.ok(ultra.includes("compaction.idleThresholdTokens=80000"));
+
+  // Below `high` the preset ships the knob at off, which is the host's reserve-based default rather
+  // than a limit of its own.
+  rt.clearExecCalls();
+  await rt.run("ts", "preset lite");
+  const lite = nativeWrites(rt);
+  assert.ok(lite.includes("compaction.thresholdPercent=-1"), lite.join(" "));
+});
+
 test("a knob set next to a preset keeps the preset's tier dials and says the state is custom", async () => {
   const rt = await createRuntime();
   await rt.start();
@@ -932,6 +1168,223 @@ test("/ts set ponytail writes the entry the ponytail plugin reads", async () => 
   );
 });
 
+// A bare invocation is "configure this": the menu is the command, and the text moves behind its own
+// verb — with the old text kept as the fallback for a session that has no selector to offer.
+test("bare /token-saver opens the menu, and prints status when there is no selector", async () => {
+  const asked = [];
+  const rt = await createRuntime([], EXTENSION_FILES, {
+    select: (title) => {
+      asked.push(title);
+      return title === "Supreme Token Saver" ? "Preset" : "off";
+    },
+  });
+  await rt.start();
+
+  await rt.run("token-saver");
+  assert.deepEqual(asked, ["Supreme Token Saver", "Token Saver · preset (this session)"]);
+  assert.match(rt.row(), /^🧩 OFF · /, "the pick reached the preset");
+
+  const headless = await createRuntime();
+  await headless.start();
+  await headless.run("ts");
+  assert.match(headless.notifications.at(-1).text, /^Token Saver: /);
+});
+
+test("bare /combo stays preset-only instead of opening the menu", async () => {
+  const rt = await createRuntime([], EXTENSION_FILES, {
+    select: () => assert.fail("/combo never had a menu"),
+  });
+  await rt.start();
+
+  await rt.run("combo");
+  assert.match(rt.notifications.at(-1).text, /^Token Saver: /);
+});
+
+// The row is the UI the pack prints, so the menu configures it directly and previews it: a shape has
+// to be choosable by what it looks like, not by its name.
+test("/ts config configures the footer row and previews each shape", async () => {
+  const asked = [];
+  const rt = await createRuntime([], EXTENSION_FILES, {
+    select: (title, options) => {
+      if (title === "Supreme Token Saver") {
+        asked.push("menu");
+        return "Footer row";
+      }
+      asked.push(options.map((option) => option.label));
+      asked.push(options.find((option) => option.label === "names").description);
+      return "names";
+    },
+  });
+  await rt.start();
+  await rt.run("ts", "preset max");
+
+  await rt.run("ts", "config");
+  assert.equal(asked[0], "menu", "the row entry is on the top level, not only under Knob");
+  assert.deepEqual(asked[1], ["off", "preset", "compact", "names", "full"]);
+  assert.match(
+    asked[2],
+    /^every tool spelled out, no icons — 🧩 MAX · caveman: ULTRA · rtk: ON · auto: ON · ponytail: ULTRA/,
+    "the description is the row this shape would render, not a second template"
+  );
+  assert.match(rt.row(), /^🧩 MAX · caveman: ULTRA · rtk: ON · auto: ON · ponytail: ULTRA · read: FULL/);
+});
+
+// A config file that does not parse must not be replaced by the next write: reading it yields the
+// built-in defaults, so writing on top of it would silently discard everything it held.
+test("a hand-broken config is refused, not overwritten", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  writeFileSync(CONFIG_FILE, '{ "version": 2, "preset": "lite", }');
+  await rt.run("ts", "default ultra");
+
+  const refusal = rt.notifications.at(-1);
+  assert.equal(refusal.type, "warning");
+  assert.match(refusal.text, /Config not written: .*is not valid JSON/);
+  assert.equal(
+    readFileSync(CONFIG_FILE, "utf8"),
+    '{ "version": 2, "preset": "lite", }',
+    "the broken file is left exactly as the user left it"
+  );
+});
+
+// The row is built from the knob table, so a knob added there cannot be missing from every shape.
+// `status` is the one legitimate exclusion: it picks the shape, so it cannot be a segment of it.
+test("every knob in the table has a segment in the row, except the shape knob", async () => {
+  const { KNOBS, MODE_KNOBS } = await import(pathToFileURL(join(EXT, "shared", "session-state.js")).href);
+  const rt = await createRuntime();
+  await rt.start();
+
+  const row = rt.row();
+  const expected = MODE_KNOBS.filter((knob) => knob !== "status");
+  for (const knob of expected) {
+    assert.ok(KNOBS[knob], `${knob} is a knob`);
+    assert.ok(row.includes(knob === "autoRtk" ? "auto:" : `${knob}:`), `${knob} appears in the row`);
+  }
+  assert.equal(segments(row).length, expected.length + 1, "preset marker plus one segment per knob");
+});
+
+// An option value no verb would accept is not obeyed either: honoring it would make the gate read one
+// setting while `/ts status` printed another.
+test("an option value outside the accepted vocabulary is ignored, not obeyed", async () => {
+  writeFileSync(CONFIG_FILE, JSON.stringify({ version: 2, options: { native: { mode: "yes" } } }));
+  const { readOptions } = await import(pathToFileURL(join(EXT, "shared", "session-state.js")).href);
+  assert.equal(readOptions().native.mode, "off", "falls back to the default rather than reading `yes`");
+});
+
+// The knob is the wiring, not a label: `on` has to route, `off` has to unroute, and the row has to say
+// which of the two actually happened.
+test("/ts set headroom=on routes the session and shows it on the row", async () => {
+  const rt = await createRuntime([], EXTENSION_FILES, { model: DEEPSEEK });
+  await rt.start();
+
+  await withProxyHealth(() => rt.run("ts", "set headroom=on"), {
+    config: { openai_api_url: DEEPSEEK.baseUrl },
+  });
+  assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787, "the provider is on the proxy");
+  assert.match(rt.row(), /🔀 headroom: ON/);
+
+  await rt.run("ts", "set headroom=off");
+  assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl, "the provider is back on its own endpoint");
+  assert.match(rt.row(), /🔀 headroom: OFF/);
+});
+
+// Every preset carries headroom=off, so applying one on a routed session unroutes it: the knob is part
+// of a preset like the others, and the row cannot keep claiming a routing the preset turned off.
+test("a preset turns the headroom knob off and unroutes", async () => {
+  const rt = await createRuntime([], EXTENSION_FILES, { model: DEEPSEEK });
+  await rt.start();
+  await withProxyHealth(() => rt.run("ts", "set headroom=on"), {
+    config: { openai_api_url: DEEPSEEK.baseUrl },
+  });
+  assert.match(rt.row(), /🔀 headroom: ON/);
+
+  await rt.run("ts", "preset max");
+  assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl);
+  assert.match(rt.row(), /🔀 headroom: OFF/);
+});
+
+// A resumed session was routed by a process that has since ended: the entry still says `on`, so the
+// session re-establishes the wiring it was left with.
+test("a session that was left routed re-wraps on session start", async () => {
+  const branch = [{ type: "custom", customType: "ts-mode", data: { name: "headroom", value: "on" }, id: "e1" }];
+  const rt = await createRuntime(branch, EXTENSION_FILES, { model: DEEPSEEK });
+
+  await withProxyHealth(async () => {
+    await rt.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }, { config: { openai_api_url: DEEPSEEK.baseUrl } });
+
+  assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787, "the wiring is back");
+  assert.match(rt.row(), /🔀 headroom: ON/);
+});
+
+// A preset speaks about behaviour; the row's shape is a preference the user set. Applying one must not
+// relayout the footer under them, whichever shape they chose.
+test("no preset touches the row's shape", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  await rt.run("ts", "set status=names");
+  for (const preset of ["off", "lite", "medium", "high", "max", "ultra"]) {
+    await rt.run("ts", `preset ${preset}`);
+    assert.match(rt.row(), /^🧩 [A-Z]+ · caveman: [A-Z]+ · /, `${preset} still spells the tools out`);
+    assert.equal(rt.row().includes("🦴"), false, `${preset} kept the icon-free shape`);
+  }
+
+  await rt.run("ts", "set status=preset");
+  await rt.run("ts", "preset ultra");
+  assert.equal(rt.row(), "🧩 ULTRA", "the one-word shape survives a preset too");
+});
+
+// The shape is still storable for new sessions — it just is not part of a preset.
+test("the row's shape stores as a preference and is replayed from the session", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  await rt.run("ts", "default status=compact");
+
+  const { readConfig } = await import(pathToFileURL(join(EXT, "shared", "session-state.js")).href);
+  assert.equal(readConfig().modes.status, "compact", "a new session resolves the stored shape");
+  assert.equal(readConfig().preset, "max", "a shape preference is not a behaviour, so the preset stands");
+
+  const branch = [{ type: "custom", customType: "ts-mode", data: { name: "status", value: "compact" }, id: "e1" }];
+  const replayed = await createRuntime(branch);
+  await replayed.start();
+  assert.match(replayed.row(), /^🧩 MAX · 🦴U · 🦀ON · 🔁ON · /, "the branch replays the shape it was left with");
+});
+
+test("preset ultra turns headroom on, and the presets below it turn it back off", async () => {
+  const rt = await createRuntime([], EXTENSION_FILES, { model: DEEPSEEK });
+  await rt.start();
+
+  await withProxyHealth(() => rt.run("ts", "preset ultra"), {
+    config: { openai_api_url: DEEPSEEK.baseUrl },
+  });
+  assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787, "ultra routed the session");
+  assert.match(rt.row(), /🔀 headroom: ON/);
+
+  await rt.run("ts", "preset max");
+  assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl, "max unroutes it again");
+  assert.match(rt.row(), /🔀 headroom: OFF/);
+});
+
+// Writing a preset for new sessions drops the behaviour overrides that would fight it — but the row's
+// shape is not behaviour, so a stored shape preference has to survive it.
+test("storing a preset keeps a stored row-shape preference", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  await rt.run("ts", "default status=names");
+  await rt.run("ts", "default lite");
+
+  const stored = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+  assert.equal(stored.preset, "lite");
+  assert.equal(stored.modes.status, "names", "the shape preference outlives the preset write");
+
+  const { readConfig } = await import(pathToFileURL(join(EXT, "shared", "session-state.js")).href);
+  assert.equal(readConfig().modes.status, "names");
+  assert.equal(readConfig().preset, "lite", "and the preset is still what the behaviour knobs say");
+});
+
 test("/ts option rejects a group that no longer exists", async () => {
   const rt = await createRuntime();
   await rt.start();
@@ -942,4 +1395,48 @@ test("/ts option rejects a group that no longer exists", async () => {
   assert.match(refused.text, /Unknown option: compress\.maxLines=100/);
   assert.match(refused.text, /autoRtk\.\{timeoutMs\|exclude\}/);
   assert.equal(existsSync(CONFIG_FILE), false, "a rejected option writes nothing");
+});
+
+// The menu is a front end for the verbs, not a second implementation: a pick has to reach the same
+// write the typed form reaches. Selectors answer with their label, so a label is a real value.
+test("/ts config reaches the same writes as the typed verbs", async () => {
+  const picks = ["Knob", "ponytail", "off", "This session"];
+  const rt = await createRuntime([], EXTENSION_FILES, { select: () => picks.shift() });
+  await rt.start();
+
+  await rt.run("ts", "config");
+  assert.deepEqual(
+    rt.entries.filter((entry) => entry.customType === "ponytail-mode").map((entry) => entry.data),
+    [{ mode: "off" }],
+    "a session-scoped pick writes what `/ts set ponytail=off` writes"
+  );
+  assert.match(rt.row(), /ponytail: OFF/);
+
+  // The same menu, the other scope: the pick lands in the config file and not in the session.
+  const stored = ["Knob", "read", "off", "New sessions"];
+  rt.ctx.ui.select = () => stored.shift();
+  await rt.run("ts", "config");
+  assert.equal(JSON.parse(readFileSync(CONFIG_FILE, "utf8")).modes.read, "off", "stored for new sessions");
+  assert.match(rt.row(), /read: FULL/, "storing a default leaves the running session alone");
+  assert.deepEqual(stored, [], "the menu consumed exactly the selectors it showed");
+});
+
+test("/ts config with no selector prints the verbs instead of opening nothing", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  rt.ctx.hasUI = false;
+
+  await rt.run("ts", "config");
+  assert.match(rt.notifications.at(-1).text, /No selector in this session/);
+});
+
+test("/ts config escape lands on nothing", async () => {
+  const rt = await createRuntime([], EXTENSION_FILES, { select: () => undefined });
+  await rt.start();
+  const before = rt.row();
+
+  await rt.run("ts", "config");
+  assert.deepEqual(rt.entries, [], "an abandoned menu writes no session entry");
+  assert.equal(rt.row(), before, "an abandoned menu leaves the row alone");
+  assert.equal(existsSync(CONFIG_FILE), false, "an abandoned menu writes no config");
 });

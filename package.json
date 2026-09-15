@@ -1,7 +1,7 @@
 {
   "name": "@dillydalli3r/oh-my-pi-supreme-token-saver",
   "version": "2.0.0",
-  "description": "Eight token-saving knobs for OMP — caveman replies, RTK shell compaction, ponytail code minimalism, auto-RTK, and a unified status row — driven by six presets from off to ultra. The pack selects OMP's own shellMinimizer, compaction and read.summarize settings and layers prompt-level add-ons on top; it ships no compressor of its own. Also includes one /token-saver command surface, a manual updater, and a first-run defaults file.",
+  "description": "Nine token-saving knobs for OMP — caveman replies, RTK shell compaction, ponytail code minimalism, auto-RTK, compaction-trigger timing, and a unified status row — driven by six presets from off to ultra. The pack selects OMP's own shellMinimizer, compaction and read.summarize settings and layers prompt-level add-ons on top; it ships no compressor of its own. Also includes one /token-saver command surface, a manual updater, and a first-run defaults file.",
   "keywords": [
     "omp",
     "oh-my-pi",
@@ -37,7 +37,9 @@
   },
   "omp": {
     "extensions": [
-      "./extensions/amanai-reward/index.js"
+      "./extensions/amanai-reward/index.js",
+      "./extensions/token-saver/index.js",
+      "./extensions/shared/mode-reinforcement.js"
     ]
   },
   "pi": {

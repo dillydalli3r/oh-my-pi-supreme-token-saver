@@ -2,15 +2,15 @@
 
 A fork of [`@fernado03/oh-my-pi-supreme-token-saver`](https://www.npmjs.com/package/@fernado03/oh-my-pi-supreme-token-saver)
 for [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi). It ships six presets (`off` → `ultra`) over
-eight knobs — `caveman`, `rtk`, `ponytail`, `read`, `compress`, `prune`, `autoRtk`, `status` — behind one
-command surface (`/token-saver`, alias `/ts`; `/combo` kept as a preset-only alias) and one footer row.
-The `read`, `compress` and `prune` knobs drive OMP's **own** native token-economy settings
+nine knobs — `caveman`, `rtk`, `ponytail`, `read`, `compress`, `prune`, `threshold`, `autoRtk`, `status` —
+behind one command surface (`/token-saver`, alias `/ts`; `/combo` kept as a preset-only alias) and one footer row.
+The `read`, `compress`, `prune` and `threshold` knobs drive OMP's **own** native token-economy settings
 (`read.summarize.*`, `shellMinimizer.*`, `compaction.*`, artifact spill, `read.defaultLimit`) through
 `omp config`, gated by `options.native.mode`; the preset supplies those knobs' starting levels plus four
 tier dials (`task.*`, `tools.intentTracing`, `skillful`) that no single knob owns. On top of that it adds
 three prompt-level add-ons — caveman terseness, RTK shell guidance, Ponytail code minimalism — and a
 passive Amanai reward detector that only raises a local notice
-when a completed final response contains a footer-shaped `AMANAI-GACHA-…` key; it never stores, sends, or
+when a completed final response contains an `AMANAI-GACHA-…` key anywhere in its text; it never stores, sends, or
 redeems the key. The pack reports no measured saving of its own.
 
 ## What this actually saves — read before installing
@@ -20,10 +20,11 @@ structural read summaries (`read.summarize.*`), the shell-output minimizer (`she
 spill (`tools.artifact*`), and cache-aware pruning of stale reads (`compaction.supersedeReads`,
 `compaction.dropUseless`), all ON by default. Verified against a stock `omp config`:
 `read.summarize.enabled=true`, `shellMinimizer.enabled=true`, `compaction.supersedeReads=true`,
-`compaction.dropUseless=true`. This pack runs none of that itself: the `read`, `compress` and `prune` knobs
-select those host settings and tune their thresholds, key by key, under [Native settings](#native-settings).
+`compaction.dropUseless=true`. This pack runs none of that itself: the `read`, `compress`, `prune` and
+`threshold` knobs select those host settings and tune their thresholds, key by key, under
+[Native settings](#native-settings).
 One honest consequence: a knob level named `off` writes `false` into its keys, so a preset carrying
-`read=off` / `prune=off` (presets `off`, `lite`, and `medium` for `prune`) turns the host's summaries and
+`read=off` / `prune=off` (presets `lite`, and `medium` for `prune`) turns the host's summaries and
 pruning **off** rather than leaving stock behaviour alone. Stock behaviour is what preset `off` restores,
 by resetting those keys instead of writing values.
 
@@ -47,7 +48,7 @@ Measured evidence, so you can calibrate expectations:
   ([Chroma research](https://www.trychroma.com/research/context-rot)), so omission beats summarization:
   dropping a stale tool result is worth more than restating it.
 
-Conclusion: treat every number this pack prints (including `/rtk gain` and the `👁` meter) as an estimate,
+Conclusion: treat every number this pack prints (including `/rtk gain`) as an estimate,
 and measure your own bill with a paired A/B before believing any of it. **Never let `rtk gain` be the
 success metric** — it is the CLI's own self-reported counter and it disagreed with the paired measurement
 above.
@@ -64,7 +65,8 @@ node install-omp-addons.js install --yes
 
 Windows: run `install.bat` in the clone — no arguments runs `node install-omp-addons.js install --yes`,
 and any arguments pass straight through (`install.bat --dry-run`, `install.bat doctor`,
-`install.bat update --verbose`).
+`install.bat update --verbose`). The window waits for a keypress before it closes, so a failure is
+readable instead of a window that vanishes.
 
 Without cloning:
 
@@ -83,47 +85,67 @@ The installer never writes OMP's native settings — that layer is opt-in (see
 
 ## Presets
 
-Exactly the table in `PRESETS` (`extensions/shared/session-state.js`). Every preset sets every knob, so a
-state either matches a preset or reports as `custom`.
+Exactly the table in `PRESETS` (`extensions/shared/session-state.js`) — plus the two knobs that are not
+columns: `status` (the row's shape, which no preset sets) and the `headroom` switch, documented just below.
+Every preset sets every *behaviour* knob, so a state either matches a preset or reports as `custom`.
 
 | Knob | off | lite | medium | high | max | ultra |
 |---|---|---|---|---|---|---|
 | `caveman` | off | lite | full | ultra | ultra | ultra |
 | `rtk` | off | on | on | on | on | on |
+| `autoRtk` | off | on | on | on | on | on |
 | `ponytail` | off | lite | full | full | ultra | ultra |
 | `read` | off | off | lite | full | full | full |
 | `compress` | off | lite | full | full | full | ultra |
 | `prune` | off | off | off | lite | full | ultra |
-| `autoRtk` | off | on | on | on | on | on |
-| `status` | full | full | full | full | full | compact |
+| `threshold` | off | off | off | lite | full | ultra |
+| `headroom` | off | off | off | off | off | **on** |
 
 Accepted values per knob: `caveman` `off|lite|full|ultra|wenyan` · `rtk` `off|on` · `ponytail`
 `off|lite|full|ultra` · `read` `off|lite|full` · `compress` `off|lite|full|ultra` · `prune`
-`off|lite|full|ultra` · `autoRtk` `off|on` · `status` `off|compact|full`.
+`off|lite|full|ultra` · `threshold` `off|lite|full|ultra` · `autoRtk` `off|on` · `headroom` `off|on` ·
+`status` `off|preset|compact|names|full`.
+
+Two knobs are deliberately outside the table above:
+
+- **`status` is not part of any preset.** It picks the footer row's *shape* — a display preference, not a
+  behaviour — so applying a preset never relayouts the row under you. Set it with `/ts set status=…` in a
+  session or `/ts default status=…` for new ones; it is a knob like the others, just not a preset column.
+- **`headroom` is the one knob a preset switches**, and only `ultra` turns it on: `on` starts (or reuses) a
+  proxy process and routes the session's provider traffic through it, which should not be a silent side effect
+  of a token dial. See [Optional: Headroom](#optional-headroom).
+
+The row is ordered by what belongs together, not by when a knob was added: `auto` (`autoRtk`) sits directly
+after the `rtk` it drives — it rewrites eligible `bash` commands through the `rtk` binary before they run, while
+the `rtk` knob is whether that binary is in play at all — and the four knobs that configure OMP's own token
+economy (`read`, `compress`, `prune`, `threshold`) stay adjacent. `status` is last because it is not a
+behaviour; it picks the row's own shape.
 
 The stored default for new sessions is `max` until changed with `/ts default <preset>`.
 
-The `read`, `compress` and `prune` columns are **knob levels, not OMP settings**: each level names the exact
-native keys it writes (see [Native settings](#native-settings)), and preset `off` pins nothing — it resets
-those mapped keys to the host defaults instead of writing anti-defaults.
+The `read`, `compress`, `prune` and `threshold` columns are **knob levels, not OMP settings**: each level
+names the exact native keys it writes (see [Native settings](#native-settings)), and preset `off` pins
+nothing — it resets those mapped keys to the host defaults instead of writing anti-defaults.
 
 ## Commands
 
-One surface. `/token-saver` and `/ts` are identical; `/combo` accepts preset names only and rejects the
-other verbs.
+One surface. `/token-saver` and `/ts` are identical; `/combo` accepts presets plus `status`, `help`,
+`preset` and `default`, and rejects the knob/option verbs.
 
 | Command | Effect |
 |---|---|
-| `/ts` or `/ts status` | Preset, every knob, context meter, config path, native gate, stored default |
+| `/token-saver` or `/ts` | Opens the settings menu — presets, knobs, stored defaults, options, `config.yml` — so nothing has to be typed or hand-edited. Prints the status text instead when the session has no selector (subagent, print run, RPC) |
+| `/ts status` | The status text: preset, every knob, config path, native gate, stored default |
+| `/ts config` (alias `/ts settings`) | The same menu, explicitly |
 | `/ts <preset>` or `/ts preset <preset>` | Apply a preset to this session (also `/combo <preset>`) |
 | `/ts set <knob>=<value> …` | Set one or more knobs for this session; all pairs validated before any is written |
 | `/ts default` | Show what new sessions start from |
 | `/ts default <preset>` | Store a preset as the default for new sessions |
-| `/ts default <knob>=<value> …` | Store a partial override (displays as `custom`) |
+| `/ts default <knob>=<value> …` | Store a partial override (displays as `custom` only when the resulting state matches no preset) |
 | `/ts default reset` | Delete the config file; back to built-in `max` |
 | `/ts option <group>.<key>=<value>` | Set a behaviour option for new sessions — `autoRtk.timeoutMs`, `autoRtk.exclude`, `native.mode` (the whole option list) |
 | `/ts native [status\|on\|off\|apply\|reset]` | Inspect/apply OMP's own settings; `on` is an alias for `auto` |
-| `/ts headroom [status\|unwrap\|wrap\|install]` | Optional external Headroom proxy: report status, `unwrap` in-session; `wrap`/`install` refuse and name the command to run yourself (see [Optional: Headroom](#optional-headroom)) |
+| `/ts headroom [status\|wrap\|unwrap\|unwrap-models\|install]` | Optional external Headroom proxy: `wrap` routes this session's provider through it (any family the proxy carries, not just Anthropic), `unwrap` unroutes and stops a proxy the pack started (see [Optional: Headroom](#optional-headroom)) |
 | `/ts help` | Usage, knob list, option list |
 
 Applying a preset or `set` persists session entries and reloads the session. `/ts set ponytail=<mode>`
@@ -137,18 +159,42 @@ Individual add-ons:
 /rtk [on|off|status|gain]                      gain prints RTK's self-reported counters
 /rtk auto [on|off|status]                      automatic rewrite of eligible bash commands
 /ponytail [lite|full|ultra|off|status]         provided by the Ponytail plugin, not by this repo
-/ai-addons <check|status>                      version check for ponytail / rtk / caveman / tokensaver
+/ai-addons <check|status>                      version check for ponytail / rtk / caveman
+tokensaver reports a local-vs-remote date estimate (it publishes no version)
 /ai-addons update <ponytail|rtk|caveman|tokensaver|all> [--dry-run]
 ```
 
 Natural-language off switch for caveman: a bare input of `caveman off`, `stop caveman`, or `normal mode`
 sets it back to `off` for the session.
 
+### Configuring it without typing commands
+
+Typing `/token-saver` (or `/ts`) opens the settings as a menu — nothing to remember, nothing to
+hand-edit. `/ts config` and `/ts settings` open the same menu; `/ts status` prints the text. Every
+entry is a front end for the verb above it, so a pick reaches the same write the typed form reaches:
+
+| Menu entry | What it opens |
+|---|---|
+| Preset | The six presets, each showing the knobs it sets; a pick applies it to the session |
+| Knob | One knob, then its level, then where it goes — **This session** (`/ts set`) or **New sessions** (`/ts default`) |
+| Footer row | The five row shapes, each option previewing the exact row it would render; a pick applies `/ts set status=<shape>` |
+| Default for new sessions | The preset list plus `reset`, which deletes `token-saver.json` |
+| Behaviour options | `autoRtk.timeoutMs`, `autoRtk.exclude`, `native.mode`; an enum picks from a list, a number or a list takes typed input |
+| OMP's own settings | `status` / `apply` / `auto` / `off` / `reset` for `config.yml`, the `/ts native` verbs |
+| Headroom | Proxy health, `wrap` / `unwrap` for this session, and `unwrap-models` for a durable wrap |
+| Status | The same text `/ts status` prints |
+
+Escape backs out of a level without writing. The menu needs the interactive TUI: a subagent, a print
+run, or an RPC client (`hasUI: false`) prints the typed verb list instead. What it writes is the same
+value a hand-edited `~/.omp/agent/token-saver.json` would hold, so the file and the menu stay
+interchangeable.
+
 ## Native settings
 
-`omp config` is the only writer of `~/.omp/agent/config.yml` (path confirmed via `omp config path`).
-**The knobs are the dial.** Each level of the `read`, `compress` and `prune` knobs names exactly which OMP
-keys that level writes; the preset supplies the level each knob starts at (the [presets table](#presets))
+`omp config` is the only writer of the native *settings* in `~/.omp/agent/config.yml` (path confirmed via
+`omp config path`) — the installer edits that file too, but only its `extensions:` list.
+**The knobs are the dial.** Each level of the `read`, `compress`, `prune` and `threshold` knobs names
+exactly which OMP keys that level writes; the preset supplies the level each knob starts at (the [presets table](#presets))
 plus the four tier dials that no single knob owns (`tools.intentTracing`, `task.maxEffort`,
 `task.softRequestBudget`, `skillful`). A state that is not exactly one of the six presets keeps the dials of
 the built-in `max` tier, and `/ts native status` reports it as `tier: max (state is custom)`.
@@ -190,10 +236,43 @@ Levels: `off` · `lite` · `full` · `ultra`.
 | `compaction.supersedeReads` | false | true | true | true | Prune older read results when the same file is read again (cache-aware) |
 | `compaction.dropUseless` | false | false | true | true | Prune tool results flagged contextually useless (no matches, timed-out waits) |
 | `compaction.keepRecentTokens` | 20000 | 20000 | 12000 | 8000 | Verbatim-history floor left after a compaction |
-| `compaction.idleEnabled` | false | false | false | true | Compact while idle when the token count exceeds threshold |
 
 `compaction.keepRecentTokens` is the main dial on post-compaction context size: it is the verbatim-history
 floor left after a compaction, and everything above that floor is what a compaction may elide.
+
+This knob decides what a compaction **may elide**; *when* it fires is the `threshold` knob below — idle
+compaction used to hang off `prune=ultra` and could never fire.
+
+### Knob `threshold` — when automatic compaction fires
+
+Levels: `off` · `lite` · `full` · `ultra`.
+
+| OMP key | off | lite | full | ultra | What it is |
+|---|---|---|---|---|---|
+| `compaction.thresholdPercent` | -1 | 85 | 70 | 55 | Share of the context window at or above which OMP compacts after a turn; `-1` = reserve-based |
+| `compaction.idleEnabled` | false | false | true | true | Also compact while the session sits idle, once the token count below is passed |
+| `compaction.idleThresholdTokens` | 200000 | 200000 | 120000 | 80000 | Token count that arms idle compaction |
+
+Those three keys are the compaction *trigger*: `prune` says what a compaction may drop, this says how full the
+context has to get before one runs.
+
+`compaction.thresholdPercent` is the only one of the three that is a *share* of the context window, which is why
+the knob dials it and not an absolute cap: the same percent means different token counts on a 200k and a 1M
+model, and an absolute number would be wrong the moment the session changes model. Lower percent = compaction
+fires earlier = fewer tokens carried per turn, but each compaction rewrites the prompt prefix, so it also means
+more cache re-reads. `off` writes `-1`, which is the host's own reserve-based default — a 16384-token floor and
+at least 15% of the window — **not** "never compact"; this knob never touches `compaction.enabled`.
+
+The idle pair is the second trigger: `off` and `lite` leave idle compaction off, `full` and `ultra` turn it on
+and bring the token trigger down with it. The two token numbers are **absolute** because the host key is —
+they are tuned for a ~200k window, so scale them down (or leave the pair at `off`) on a model whose whole
+window is well under that. The dwell, `compaction.idleTimeoutSeconds`, stays stock at 300: it is how long the
+session must sit idle before the trigger is checked, and this knob leaves it alone.
+
+This is also where the idle bug was: `prune=ultra` used to write `compaction.idleEnabled=true` while leaving
+`compaction.idleThresholdTokens` at its 200000 host default — at or above the whole usable window of many
+models, so the setting could never fire. `compaction.idleEnabled` is gone from every `prune` level, and the
+trigger family now belongs to this knob alone, switch and token trigger together.
 
 ### Tier dials — per preset, not per knob
 
@@ -215,11 +294,16 @@ Notes that matter:
   and `prune=off` writes `compaction.supersedeReads=false` plus `compaction.dropUseless=false`. That turns
   the host's summaries and pruning off — the presets `off` and `lite` carry `read=off`, and `off`, `lite`
   and `medium` carry `prune=off`.
-- `off` as a *preset* is different: it writes no keys at all and instead resets all 19 keys in these tables
+- `off` as a *preset* is different: it writes no keys at all and instead resets all 21 keys in these tables
   to whatever OMP then considers sane, which is more durable than pinning `false`.
-- Deliberately untouched: `provider.appendOnlyContext`, `memory.backend`, `advisor`/`autolearn`/`prewalk`,
+- Deliberately untouched inside `compaction.*`: `compaction.thresholdTokens` (a positive absolute cap silently
+  outranks the percent, so the pack leaves it at the host's `-1` and lets the percent follow the model),
+  `compaction.midTurnEnabled`, `compaction.methodOrder`, `compaction.asyncEnabled`, `compaction.autoContinue`
+  and `compaction.reserveTokens` — those decide *how* and *with what* a compaction runs, and this pack only
+  dials *when*. Also untouched: `provider.appendOnlyContext`, `memory.backend`, `advisor`/`autolearn`/`prewalk`,
   `snapcompact`, and every display/statusLine/tui key — display keys cost no model tokens.
-- `/ts native reset` runs one `omp` process per key (19). A missing `omp` CLI degrades to a warning
+- `/ts native reset` runs one `omp` process per key (21). A missing `omp` CLI degrades `/ts native apply`
+  (and any preset-time native write) to a warning
   (`Native settings unavailable: … config.yml untouched.`); the preset itself still applies.
 
 ## Optional: Headroom
@@ -231,8 +315,63 @@ a TypeScript SDK with no `bin`, and there is no standalone binary to download. V
 writing — **198 PyPI releases since January 2026 and still no 1.0**. Read that plainly: it is a fast-moving
 pre-1.0 tool, so pin it and read its changelog before you depend on any of it.
 
-**This pack does not bundle Headroom, does not depend on it, and never installs it.** It only detects it: `doctor`
-reports it, and `/ts headroom` reports and unwraps it. Nothing here starts Headroom or routes your traffic for you.
+**This pack does not bundle Headroom, does not depend on it, and never installs it.** It detects it, and — since
+`/ts headroom wrap` — it can route the session through it. Installing stays your job.
+
+### It is not anthropic-only, and neither is the wrap here
+
+Two different things get conflated, including in Headroom's own `wrap omp`:
+
+- **The proxy is provider-agnostic.** `headroom proxy` picks the upstream from the request's protocol and each
+  family's real endpoint comes from a flag: `--openai-api-url`, `--anthropic-api-url`, `--gemini-api-url`,
+  `--vertex-api-url`. Anything OpenAI-compatible — DeepSeek, OpenRouter, Groq, Mistral, a local server — is
+  carried end to end. Its `any-llm` backend additionally covers 38+ providers.
+- **`headroom wrap omp` is anthropic-only.** It injects a marker-fenced `providers.anthropic.baseUrl` override
+  into `~/.omp/agent/models.yml` (backed up byte-for-byte; `headroom unwrap omp` restores it) and its own help
+  says the other providers "keep their normal endpoints; route those via your own custom provider in models.yml".
+
+`/ts headroom wrap` closes that gap for the session: it reads the active model's own `api` family and `baseUrl`,
+starts (or reuses) the proxy with the matching upstream flag, and points the provider at it.
+
+### How the pack routes it — and what that scope buys
+
+| Step | Mechanism |
+|---|---|
+| Upstream | The session model's own `baseUrl` becomes the proxy's `--*api-url`, so the proxy forwards where the provider was already going |
+| Routing | `pi.registerProvider(<provider>, { baseUrl })` — a **runtime** transport override that outranks `models.yml` and the bundled catalog for that provider id, keeping its bundled models and stored credentials |
+| Take effect | `pi.setModel(resolve(<provider>/<model>))` re-points the live session (a session holds a resolved Model; the registry override alone does not move traffic) |
+| Undo | `/ts headroom unwrap` — `unregisterProvider` + re-resolve, then stop the proxy **only if this pack started it** |
+
+Scope is the trade: this routes the current process (subagents included), immediately, with no file edits and no
+restart — and stops when the session does. `headroom wrap omp` survives into new processes but only ever covers
+anthropic. Use whichever matches; they can coexist.
+
+`/ts headroom status` reports the proxy's health, the upstreams it is actually configured with (its own
+`/health`), this session's provider/family/`baseUrl`, and whether this session is routed — it reads the routing
+back off the registry rather than assuming the call took. Wrap refuses to route through a proxy already on the
+port that forwards somewhere else, since that would send this session's traffic and API key to another upstream.
+
+### The `headroom` knob
+
+Routing is also a knob, so it lands in the row, in `/ts set`, in `/ts default` and in the settings menu like
+every other setting — `off` (default, and what every preset carries) or `on`:
+
+```text
+/ts set headroom=on        # start or reuse the proxy, route this session, 🔀 headroom: ON
+/ts set headroom=off       # unroute it, stop a proxy this pack started
+/ts default headroom=on    # new sessions start routed (they wrap themselves at session start)
+```
+
+Three details that make it behave like a setting rather than a command:
+
+- **The row shows what is routed, not what was asked for.** The knob's value in the row is the *effective*
+  state: a wrap that failed (no headroom installed, no upstream flag for this provider's family, a proxy on the
+  port pointed elsewhere) publishes `off` and says why. The session *entry* keeps your intent, so a resumed
+  session retries once at session start.
+- **`ultra` turns it on, every other preset turns it off** (including `max`, the default for new sessions). A
+  preset is a token dial, so only the most aggressive one reaches for the extra process; on a machine without
+  Headroom the wrap fails, the row stays `OFF` and the reason is reported. `off` unroutes a routed session.
+- **Subagents inherit it.** They run in the same process, so they use the same routed provider.
 
 ### What it measured for us — and what it did not
 
@@ -249,20 +388,11 @@ reproduced.** They say something narrower than the word "compression": Headroom'
 payloads. Shell transcripts and prose — most of what an OMP session actually carries — came back essentially
 unchanged.
 
-### The limitation that decides it
-
-`headroom wrap omp` works by injecting a marker-fenced `providers.anthropic.baseUrl` override into
-`~/.omp/agent/models.yml` (backed up byte-for-byte pre-wrap; `headroom unwrap omp` restores it). **It only
-redirects the `anthropic` provider.** A session running on any other provider — OpenAI-direct, Gemini, DeepSeek,
-whatever else — keeps its normal endpoint and the wrap changes nothing at all. It redirects the provider, not the
-tool output, so it applies to a whole session or to none of it.
-
-This pack's native-settings layer already covers structural read summaries (`read.summarize.*`), shell-output
+This pack's native-settings layer also covers structural read summaries (`read.summarize.*`), shell-output
 minimisation (`shellMinimizer.*`) and pruning of stale results (`compaction.supersedeReads`,
-`compaction.dropUseless`) without an external process, a proxy, or a second config file — the `read`,
-`compress` and `prune` knobs select those settings, and only under `native.mode=auto`. For most sessions that is
-the better trade. Reach for Headroom when you are on Anthropic and feeding the model large repetitive JSON or log
-dumps.
+`compaction.dropUseless`) with no external process at all — the `read`, `compress`, `prune` and `threshold`
+knobs select those settings, under `native.mode=auto`. Headroom is the extra layer for large repetitive JSON
+or log traffic.
 
 ### Install (outside this pack)
 
@@ -278,15 +408,18 @@ compression core is a CPython extension rather than a standalone binary.
 
 ### Use, and how to get back out
 
-Run `headroom wrap omp` **from your own shell, never from inside a session**: it starts the proxy *and* launches a
-new `omp`, so running it inside a live session nests OMP inside OMP. After that:
-
 | Command | Effect |
 |---|---|
-| `/ts headroom` (or `/ts headroom status`) | Headroom version, wrap state, and whether a wrap would even cover this session's provider |
-| `/ts headroom unwrap` | Restore the pre-wrap `models.yml` (runs `headroom unwrap omp`; safe from inside a session) |
-| `/ts headroom wrap` | Refuses, prints the command to run yourself — starting it here would nest OMP |
+| `/ts headroom` (or `/ts headroom status`) | Headroom version, proxy health and its upstreams, the session's family and whether it is routed |
+| `/ts headroom wrap` | Start (or reuse) the proxy on the active provider's endpoint and route this session through it |
+| `/ts headroom unwrap` | Unroute this session; stop the proxy if this pack started it |
+| `/ts headroom unwrap-models` | Restore a `models.yml` a *durable* `headroom wrap omp` wrote (runs `headroom unwrap omp`) |
 | `/ts headroom install` | Refuses, prints the uv/pip/Docker lines above — this pack installs nothing for you |
+
+The proxy is a detached process the pack spawns directly (never through a shell, so the pid it records is the
+one that owns the port), logging to `~/.omp/agent/headroom.log`, with its state in `~/.omp/agent/headroom.json`.
+Run `headroom wrap omp` from your own shell only if you want the *durable* anthropic wrap: it starts a proxy and
+launches its own `omp`, so it nests OMP if run from inside a session.
 
 ## Configuration file
 
@@ -318,8 +451,8 @@ After `/ts default max`, `/ts default ponytail=off`, `/ts option autoRtk.exclude
   what **new** sessions start from; the running session is untouched.
 - `/ts option <group>.<key>=<value>` writes `options.<group>.<key>`. Only two groups exist, and the value
   type decides the syntax: `autoRtk.timeoutMs` takes a number, `autoRtk.exclude` takes a JSON array
-  (`/ts option autoRtk.exclude=[".git","dist"]`), and `native.mode` is a string — `auto` makes presets and
-  knob changes write `config.yml`, anything else (including `off`) leaves it alone. Unknown groups, unknown
+  (`/ts option autoRtk.exclude=[".git","dist"]`), and `native.mode` is a string — `auto` (or `on`/`true`) makes
+  presets and knob changes write `config.yml`, `off` leaves it alone, and any other value is rejected. Unknown groups, unknown
   keys, a non-numeric `timeoutMs`, and an `exclude` that is not a JSON array are rejected with a usage
   line. Options describe behaviour (timeouts, exclusion lists, the native gate), not intensity. They are
   stored for the sessions that follow, but two of them are read at different times: `autoRtk.*` is cached
@@ -340,33 +473,37 @@ Environment overrides:
 | `OMP_TOKEN_SAVER_CONFIG` | Path of `token-saver.json` |
 | `OMP_COMBO_DEFAULTS_FILE` | Path of the legacy `combo-defaults.json` |
 | `OMP_PONYTAIL_PACKAGE_DIR` | Location of the Ponytail plugin package (default reading/writing of its `defaultMode`) |
+| `OMP_HEADROOM_STATE` | Path of the headroom wrap state (`headroom.json`); the proxy log follows the agent dir |
+| `PI_CODING_AGENT_DIR` | Relocates the whole agent dir — the pack's `headroom.json`, the `models.yml` its headroom status reads, and the `config.yml` the native layer writes |
 
 ## Status row
 
 `extensions/shared/status-line.js` is the **only** module that writes the `modes` status key, so a knob's
-symbol never depends on how the value was set (`/ts`, a per-app command, or the stored default). One row,
-full form:
+symbol never depends on how the value was set (`/ts`, a per-app command, or the stored default). One row;
+the `status` knob picks its shape:
 
-```text
-🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: FULL · 🔁 auto: ON · 👁 42% ctx
-```
+| `status` | Row | Why |
+|---|---|---|
+| `full` (default) | `🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🔁 auto: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: FULL · ⏱️ threshold: FULL · 🔀 headroom: OFF` | Every tool named beside its icon and value |
+| `names` | `🧩 MAX · caveman: ULTRA · rtk: ON · auto: ON · ponytail: ULTRA · read: FULL · compress: FULL · prune: FULL · threshold: FULL · headroom: OFF` | The same row with no icon to decode |
+| `compact` | `🧩 MAX · 🦴U · 🦀ON · 🔁ON · 🐴U · 📖F · 🗜️F · 🧹F · ⏱️F · 🔀OFF` | Icons and one letter per value (the `max` preset here: `read`/`compress`/`prune`/`threshold` are all `full`; on/off knobs keep the word, since `ON` and `OFF` share a letter) |
+| `preset` | `🧩 MAX` | One word: the preset determines all nine knobs anyway |
+| `off` | *(no row)* | The key is deleted, not blanked |
 
-Compact form (`preset ultra`, or `status compact`):
-
-```text
-🧩 ULTRA · 🦴U · 🦀ON · 🐴U · 📖F · 🗜️U · 🧹U · 🔁ON · 👁42%
-```
-
-- The meter (`👁 NN% ctx`) is appended only when context usage is known; the usage value is published once
-  per `turn_end`/`message_end` and read back from shared state.
-- `status off` removes the row entirely (the key is deleted, not blanked).
+- The row opens with the preset, so it is also the readout of which preset the session is on — and no preset
+  changes the shape, so switching presets never moves the row's layout.
+- `/ts config` → **Footer row** lists these with the exact row each one would render, so the shape is
+  picked by what it looks like rather than spelled from memory (`Knob` → `status` sets the same knob).
+- `status` is display-only, and that is load-bearing in two places: it is excluded from the
+  preset match — choosing a row shape on an `ultra` session keeps reporting `ULTRA`, not `custom` — and
+  it writes nothing to `config.yml`, since a display key costs no model tokens.
 - Rendering is display-only: nothing in the status module changes a mode.
 
 ## File locations
 
 | What | Path |
 |---|---|
-| Token Saver extension (commands, presets, native driver) | `~/.omp/agent/extensions/token-saver/` |
+| Token Saver extension (commands, presets, native driver) | `~/.omp/agent/extensions/token-saver/` (follows `PI_CODING_AGENT_DIR`) |
 | Shared modules (`session-state.js`, `status-line.js`, `mode-reinforcement.js`) | `~/.omp/agent/extensions/shared/` |
 | Caveman extension | `~/.omp/agent/extensions/caveman-session/` |
 | RTK extension | `~/.omp/agent/extensions/rtk-session/` |
@@ -377,7 +514,7 @@ Compact form (`preset ultra`, or `status compact`):
 | RTK binary | `~/.bun/bin/rtk` (`rtk.exe` on Windows) |
 | Session defaults | `~/.omp/agent/token-saver.json` |
 | Legacy pre-2.0 defaults (read once, deleted on first write) | `~/.omp/agent/combo-defaults.json` |
-| OMP native settings and extension registrations | `~/.omp/agent/config.yml` |
+| OMP native settings and extension registrations | `~/.omp/agent/config.yml` (follows `PI_CODING_AGENT_DIR`) |
 | OMP model config (what an external `headroom wrap omp` edits) | `~/.omp/agent/models.yml` |
 | Project scope install target | `./.omp/extensions` |
 
@@ -415,7 +552,7 @@ with `/ponytail status` (it prints `current <mode> • default <mode>`).
 
 ### `omp config` unavailable
 
-The native layer is optional. With no `omp` CLI on the path, `/ts native …` and preset-time native writes
+The native layer is optional. With no `omp` CLI on the path, `/ts native apply` and preset-time native writes
 report `Native settings unavailable: … config.yml untouched.` as a warning — the preset still applies and
 no OMP file is modified. Everything else in the pack is unaffected.
 

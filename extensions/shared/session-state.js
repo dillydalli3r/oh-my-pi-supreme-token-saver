@@ -19,47 +19,74 @@ const OMP_SUBAGENT_MARKER = "You are operating on a piece of work assigned to yo
 
 // Knob -> accepted values. A knob's first value is its off state, and every preset below sets
 // every knob, so `derivePreset` can compare whole states and no knob can be half-configured.
+//
+// The order is the order every surface lists them in — the footer row, `/ts status`, `/ts default` —
+// and it is grouped rather than historical: a knob that modifies another sits directly after it
+// (`autoRtk` next to the `rtk` it auto-wraps), and the four knobs driving OMP's own token economy stay
+// together (`read`, `compress`, `prune`, `threshold`). `status` is last because it is the one knob that is not a
+// behaviour: it picks the row's shape.
 export const KNOBS = Object.freeze({
   caveman: Object.freeze(["off", "lite", "full", "ultra", "wenyan"]),
   rtk: Object.freeze(["off", "on"]),
+  autoRtk: Object.freeze(["off", "on"]),
   ponytail: Object.freeze(["off", "lite", "full", "ultra"]),
   read: Object.freeze(["off", "lite", "full"]),
   compress: Object.freeze(["off", "lite", "full", "ultra"]),
   prune: Object.freeze(["off", "lite", "full", "ultra"]),
-  autoRtk: Object.freeze(["off", "on"]),
-  status: Object.freeze(["off", "compact", "full"]),
+  // *When* compaction fires, where `prune` decides what it may elide. It is a host-side timing dial,
+  // not a prompt behaviour, so no preset below `high` moves it off OMP's reserve-based default.
+  // `off` pins that default explicitly: `-1` means "reserve-based", which is the stock host value,
+  // not "never compact".
+  threshold: Object.freeze(["off", "lite", "full", "ultra"]),
+  // The proxy routes this session's provider traffic; `on` is an explicit opt-in to a process being
+  // started, which is why no preset turns it on — a preset is a token dial, not a licence to spawn a
+  // proxy on a machine that may not even have headroom installed.
+  headroom: Object.freeze(["off", "on"]),
+  status: Object.freeze(["off", "preset", "compact", "names", "full"]),
 });
 
 export const MODE_KNOBS = Object.freeze(Object.keys(KNOBS));
 
-// Presets, lightest first. `lite` is the smallest useful saving; `ultra` trades prompt tokens
-// for behaviour (deferred tool schemas, aggressive pruning) on top of `max`.
+// Presets, lightest first. `lite` is the smallest useful saving; `ultra` trades prompt tokens for
+// behaviour (deferred tool schemas, aggressive pruning) on top of `max`.
+//
+// A preset describes *behaviour* only: it deliberately carries no `status`, so applying one can never
+// change the footer row's layout under you — the shape is a preference, set with `/ts set status=` or
+// stored with `/ts default status=`. `headroom` is the one knob a preset switches, and only `ultra`
+// turns it on, because it is the only knob whose `on` starts a process.
 const PRESETS = Object.freeze({
   off: Object.freeze({
-    caveman: "off", rtk: "off", ponytail: "off", read: "off",
-    compress: "off", prune: "off", autoRtk: "off", status: "full",
+    caveman: "off", rtk: "off", autoRtk: "off", ponytail: "off",
+    read: "off", compress: "off", prune: "off", threshold: "off", headroom: "off",
   }),
   lite: Object.freeze({
-    caveman: "lite", rtk: "on", ponytail: "lite", read: "off",
-    compress: "lite", prune: "off", autoRtk: "on", status: "full",
+    caveman: "lite", rtk: "on", autoRtk: "on", ponytail: "lite",
+    read: "off", compress: "lite", prune: "off", threshold: "off", headroom: "off",
   }),
   medium: Object.freeze({
-    caveman: "full", rtk: "on", ponytail: "full", read: "lite",
-    compress: "full", prune: "off", autoRtk: "on", status: "full",
+    caveman: "full", rtk: "on", autoRtk: "on", ponytail: "full",
+    read: "lite", compress: "full", prune: "off", threshold: "off", headroom: "off",
   }),
   high: Object.freeze({
-    caveman: "ultra", rtk: "on", ponytail: "full", read: "full",
-    compress: "full", prune: "lite", autoRtk: "on", status: "full",
+    caveman: "ultra", rtk: "on", autoRtk: "on", ponytail: "full",
+    read: "full", compress: "full", prune: "lite", threshold: "lite", headroom: "off",
   }),
   max: Object.freeze({
-    caveman: "ultra", rtk: "on", ponytail: "ultra", read: "full",
-    compress: "full", prune: "full", autoRtk: "on", status: "full",
+    caveman: "ultra", rtk: "on", autoRtk: "on", ponytail: "ultra",
+    read: "full", compress: "full", prune: "full", threshold: "full", headroom: "off",
   }),
   ultra: Object.freeze({
-    caveman: "ultra", rtk: "on", ponytail: "ultra", read: "full",
-    compress: "ultra", prune: "ultra", autoRtk: "on", status: "compact",
+    caveman: "ultra", rtk: "on", autoRtk: "on", ponytail: "ultra",
+    read: "full", compress: "ultra", prune: "ultra", threshold: "ultra", headroom: "on",
   }),
 });
+
+// What a preset speaks about: every knob except the row's shape.
+export const BEHAVIOUR_KNOBS = Object.freeze(MODE_KNOBS.filter((knob) => knob !== "status"));
+
+// The row shape a session starts with when nothing stored a preference. It lives beside the presets
+// rather than inside them, which is what keeps a preset application from touching the layout.
+export const DEFAULT_STATUS = "full";
 
 export const PRESET_NAMES = Object.freeze(Object.keys(PRESETS));
 export const DEFAULT_PRESET = "max";
@@ -74,7 +101,7 @@ const LEGACY_DEFAULTS_FILE =
 
 // Numeric/extras a behaviour actually reads. Only keys with a reader live here: everything else a
 // user could set would be a knob that changes nothing, and `/ts option` would advertise it.
-// The `read` / `compress` / `prune` behaviours are configured through OMP's own settings
+// The `read` / `compress` / `prune` / `threshold` behaviours are configured through OMP's own settings
 // (read.summarize.*, shellMinimizer.*, compaction.*) — the knob levels drive those, mapped by
 // token-saver, not by this file.
 export const DEFAULT_OPTIONS = Object.freeze({
@@ -82,6 +109,9 @@ export const DEFAULT_OPTIONS = Object.freeze({
   // Whether applying a preset also writes the matching OMP settings in ~/.omp/agent/config.yml.
   // `off` keeps the user's own OMP config untouched unless `/ts native apply` asks for it.
   native: Object.freeze({ mode: "off" }),
+  // Which port the pack's headroom proxy listens on. 8787 is headroom's own default, so a proxy you
+  // started yourself owns it — this is how the pack runs beside one instead of fighting it.
+  headroom: Object.freeze({ port: 8787 }),
 });
 
 // Accepted values for the string options. An option that gates a behaviour is an enum, not free
@@ -131,10 +161,13 @@ export function normalizePreset(value) {
 }
 
 // Whole-state comparison: a state that matches a preset reports that preset, anything else is custom.
+// `status` is display-only — it costs no model tokens and changes no behaviour — so it is left out of
+// the comparison: picking a row shape must not demote the session to `custom` (which would also drop
+// the preset's native tier dials) on a session whose compression knobs still are a preset.
 function derivePreset(modes) {
   for (const name of PRESET_NAMES) {
     const preset = PRESETS[name];
-    if (MODE_KNOBS.every((knob) => preset[knob] === modes[knob])) return name;
+    if (BEHAVIOUR_KNOBS.every((knob) => preset[knob] === modes[knob])) return name;
   }
   return "custom";
 }
@@ -147,7 +180,7 @@ export function presetModes(name) {
 // `modes` wins over the preset for the keys it sets, so a partial config stays a partial override.
 function resolveModes({ preset = DEFAULT_PRESET, modes } = {}) {
   const base = presetModes(preset) || presetModes(DEFAULT_PRESET);
-  const resolved = { ...base };
+  const resolved = { status: DEFAULT_STATUS, ...base };
   for (const knob of MODE_KNOBS) {
     const mode = normalizeMode(knob, modes?.[knob]);
     if (mode) resolved[knob] = mode;
@@ -187,14 +220,18 @@ function matchesShape(expected, value) {
   return !Array.isArray(value) && typeof value === typeof expected;
 }
 
-export function readOptions() {
-  const stored = readStored().options || {};
+export function readOptions(stored = readStored()) {
   const options = {};
   for (const group of Object.keys(DEFAULT_OPTIONS)) {
     const merged = { ...DEFAULT_OPTIONS[group] };
-    for (const [key, value] of Object.entries(stored[group] || {})) {
+    for (const [key, value] of Object.entries((stored.options || {})[group] || {})) {
       if (!owns(merged, key)) continue;
-      if (matchesShape(merged[key], value)) merged[key] = value;
+      if (!matchesShape(merged[key], value)) continue;
+      // A value no verb would accept must not be obeyed either: `native.mode: "yes"` would read as
+      // "not auto" to the gate while `/ts status` printed `yes` as if it were the setting.
+      const allowed = OPTION_VALUES[group]?.[key];
+      if (allowed && !allowed.includes(value)) continue;
+      merged[key] = value;
     }
     options[group] = Object.freeze(merged);
   }
@@ -212,7 +249,7 @@ export function readConfig() {
     // session would not render. Whole-state derivation already answers `custom` when nothing matches.
     preset: derivePreset(modes),
     modes: Object.freeze(modes),
-    options: readOptions(),
+    options: readOptions(stored),
   });
 }
 
@@ -223,6 +260,12 @@ export function readDefaultModes() {
 // Patch keys: `preset` (replaces every mode), `modes` (per-knob override), `options` (global
 // behaviour). Ponytail keeps its own default upstream, so the caller syncs it separately.
 export function writeConfig(patch = {}) {
+  // A file that exists but does not parse (a hand-edit typo, a truncated write) reads back as the
+  // built-in defaults, so writing on top of it would silently replace everything it held. Refusing is
+  // the only outcome that does not lose data the user can still fix by hand.
+  if (fs.existsSync(CONFIG_FILE) && !readJson(CONFIG_FILE)) {
+    return { config: readConfig(), error: `${CONFIG_FILE} is not valid JSON — not overwritten` };
+  }
   const stored = readStored();
   const next = { version: 2 };
 
@@ -233,9 +276,10 @@ export function writeConfig(patch = {}) {
     if (mode) modes[knob] = mode;
   }
 
-  // A preset patch is a whole-state statement: dropping the overrides is what makes it stick.
+  // A preset patch is a whole-state statement about *behaviour*: dropping those overrides is what makes
+  // the preset stick. The row's shape is not behaviour, so a stored preference survives it.
   if (patch.preset) {
-    for (const knob of MODE_KNOBS) delete modes[knob];
+    for (const knob of BEHAVIOUR_KNOBS) delete modes[knob];
   }
   next.preset = preset;
   if (Object.keys(modes).length) next.modes = modes;
@@ -336,7 +380,7 @@ export function syncPonytailDefault(mode) {
 function bridge() {
   const existing = globalThis[BRIDGE_KEY];
   if (existing?.state) return existing;
-  return (globalThis[BRIDGE_KEY] = { state: defaultState(), listener: null, usage: null, owner: null });
+  return (globalThis[BRIDGE_KEY] = { state: defaultState(), listener: null, owner: null });
 }
 
 function defaultState() {
@@ -352,9 +396,10 @@ function freezeState(modes, preset) {
 
 function publish(patch) {
   const shared = bridge();
+  const next = { ...shared.state, ...patch };
   const modes = {};
   for (const knob of MODE_KNOBS) {
-    modes[knob] = normalizeMode(knob, { ...shared.state, ...patch }[knob]) || shared.state[knob];
+    modes[knob] = normalizeMode(knob, next[knob]) || shared.state[knob];
   }
   shared.state = freezeState(modes, patch?.preset);
   shared.listener?.(shared.state);
@@ -378,16 +423,6 @@ export function setSharedPreset(name) {
 export function setSharedMode(name, value) {
   const mode = normalizeMode(name, value);
   return mode ? publish({ [name]: mode }) : getSharedState();
-}
-
-// Live context usage (percent) published by the meter, so the footer row can render it without
-// every add-on reaching for ctx.getContextUsage().
-export function setSharedUsage(usage) {
-  bridge().usage = usage || null;
-}
-
-export function getSharedUsage() {
-  return bridge().usage;
 }
 
 // The custom types that carry a statement about the level to run at; anything else in a branch

@@ -2,9 +2,12 @@ import { MODE_KNOBS, getSharedState, isOmpSubagentPrompt, reconcileSharedEntries
 
 const MARKER = "SUPREME TOKEN SAVER MODES ACTIVE";
 
-// `status` only picks the footer row's shape, so it never changes what the model is told to do —
-// including it would keep the line alive when every behaviour knob is off.
-const REINFORCED_KNOBS = Object.freeze(MODE_KNOBS.filter((name) => name !== "status"));
+// `status` only picks the footer row's shape, `headroom` is provider plumbing, and `threshold` is a
+// host-side compaction timing setting — none of the three changes what the model is told to do, so
+// including them would keep the line alive with nothing to act on.
+const REINFORCED_KNOBS = Object.freeze(
+  MODE_KNOBS.filter((name) => name !== "status" && name !== "headroom" && name !== "threshold")
+);
 
 const PHRASES = Object.freeze({
   caveman: "concise Caveman prose",
@@ -18,6 +21,16 @@ const PHRASES = Object.freeze({
 
 function entriesFrom(ctx) {
   return ctx?.sessionManager?.getBranch?.() || ctx?.sessionManager?.getEntries?.() || [];
+}
+
+// Folding the branch back in reads two config files synchronously, and this handler runs before every
+// agent start. The pack's state only changes when an entry lands, so an unchanged branch cannot have
+// anything new to fold: reconcile when the branch grew, and let the bridge (which every add-on writes
+// directly) carry everything else.
+let lastBranchKey = "";
+
+function branchKey(entries) {
+  return `${entries.length}:${entries[entries.length - 1]?.id || ""}`;
 }
 
 function instruction(state, subagent) {
@@ -46,7 +59,12 @@ export default function modeReinforcementExtension(pi) {
     const base = [].concat(event.systemPrompt ?? []);
     if (base.some((prompt) => typeof prompt === "string" && prompt.includes(MARKER))) return;
 
-    reconcileSharedEntries(entriesFrom(ctx), ctx?.sessionManager?.getSessionId?.());
+    const entries = entriesFrom(ctx);
+    const key = branchKey(entries);
+    if (key !== lastBranchKey) {
+      lastBranchKey = key;
+      reconcileSharedEntries(entries, ctx?.sessionManager?.getSessionId?.());
+    }
     // One line per mode set, byte-stable for a given set: re-asserting it after a compaction (or on
     // any later turn) appends the same bytes, so it never invalidates the cached prompt prefix.
     const text = instruction(getSharedState(), isOmpSubagentPrompt(base));
