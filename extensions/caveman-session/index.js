@@ -98,9 +98,9 @@ export default function cavemanSessionExtension(pi) {
     currentMode = resolveMode(entries);
   }
 
+  // No startup notify: the combo footer row already reports caveman: ULTRA|OFF.
   pi.on("session_start", async (_event, ctx) => {
     restoreMode(ctx);
-    ctx?.ui?.notify?.(`Caveman loaded: ${currentMode}`, "info");
   });
 
   pi.on("session_branch", async (_event, ctx) => {

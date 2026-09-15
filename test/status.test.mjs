@@ -94,7 +94,11 @@ async function createRuntime(branch = []) {
     hasUI: true,
     cwd: process.cwd(),
     ui: {
-      setStatus: (key, text) => status.set(key, text),
+      // omp's setHookStatus deletes the key for `undefined` and keeps any other string.
+      setStatus: (key, text) => {
+        if (text === undefined) status.delete(key);
+        else status.set(key, text);
+      },
       notify: (text, type) => notifications.push({ text, type }),
     },
     sessionManager: { getBranch: () => entries },
@@ -161,6 +165,13 @@ test("fresh session: one status row with stable markers for all three apps", asy
   assert.equal(rt.row(), "🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA");
 });
 
+test("session start is silent: no add-on announces itself loading", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  assert.deepEqual(rt.notifications, []);
+});
+
 test("combo, per-app commands and the plugin default agree on every per-app symbol", async () => {
   const combo = await createRuntime();
   await combo.start();
@@ -211,8 +222,7 @@ test("everything off clears the row", async () => {
   await rt.start();
   await rt.run("combo", "off");
 
-  assert.deepEqual(rt.keys(), ["modes"]);
-  assert.equal(rt.row(), "");
+  assert.deepEqual(rt.keys(), [], "an empty status string still draws a row, so the key must go");
 });
 
 test("a session with /combo off entries stays off", async () => {
@@ -224,7 +234,7 @@ test("a session with /combo off entries stays off", async () => {
   ]);
   await rt.start();
 
-  assert.equal(rt.row(), "");
+  assert.deepEqual(rt.keys(), []);
 });
 
 test("subagents inherit caveman and rtk", async () => {
@@ -242,7 +252,7 @@ test("a fresh session starts from the persisted default", async () => {
   try {
     const rt = await createRuntime();
     await rt.start();
-    assert.equal(rt.row(), "");
+    assert.deepEqual(rt.keys(), []);
   } finally {
     clearDefaults();
   }

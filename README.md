@@ -2,13 +2,14 @@
 
 A passive Amanai reward detector plus three toggleable [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi) add-ons for terse replies, compact shell output, and minimal code decisions. It also includes combined toggles, health checks, updates, and dry-run support.
 
-Fork of [`@fernado03/oh-my-pi-supreme-token-saver`](https://www.npmjs.com/package/@fernado03/oh-my-pi-supreme-token-saver) with three behavior changes:
+Fork of [`@fernado03/oh-my-pi-supreme-token-saver`](https://www.npmjs.com/package/@fernado03/oh-my-pi-supreme-token-saver) with four behavior changes:
 
 | Change | Before | Now |
 |---|---|---|
 | Session default | every mode off until you enable it | a fresh session behaves like `/combo max` (caveman `ultra`, RTK on, ponytail `ultra`); `/combo default <level\|app=mode>` changes what fresh sessions start from, and `/combo off` still opts one session out |
 | Status bar | one footer row per add-on, and the ponytail row used a different marker per mode (`🔥`/`⚡`/`🌿`) | a **single** row for all three: `🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA` — the marker per app is fixed and does not depend on whether the mode came from `/combo`, a per-app command, or the session default |
-| Ponytail config path | installer wrote `~/.config/ponytail/config.json`, which the plugin does not read on Windows | installer writes the path the plugin actually resolves (`$XDG_CONFIG_HOME`, then `%APPDATA%`, then `~/.config`) and sets `hideStatus: true` so the plugin does not add a second, competing row |
+| Ponytail config path | installer wrote `~/.config/ponytail/config.json`, which the plugin does not read on Windows | installer writes the path the plugin actually resolves (`$XDG_CONFIG_HOME`, then `%APPDATA%`, then `~/.config`) and sets `hideStatus: true` plus `quietStartup: true`, so the plugin adds neither a second, competing row nor a `Ponytail loaded: <mode>` toast at session start |
+| Startup toasts | every session start raised `RTK loaded: on` and `Caveman loaded: <mode>` on top of the combo row | no add-on announces itself at session start — RTK and Caveman set their state silently, the ponytail plugin runs with `quietStartup: true`, and the combo footer row (`🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA`) is the only status line |
 
 ## Install
 
@@ -19,6 +20,8 @@ git clone https://github.com/dillydalli3r/oh-my-pi-supreme-token-saver
 cd oh-my-pi-supreme-token-saver
 node install-omp-addons.js install --yes
 ```
+
+On Windows, `install.bat` in the clone does the same thing without typing the Node path — double-click it, or run `install.bat` from a shell; with no arguments it runs `node install-omp-addons.js install --yes`, and any arguments are passed straight through (`install.bat --dry-run`, `install.bat doctor`, `install.bat update`).
 
 Without cloning (npm runs the packaged `bin` straight from GitHub; npm 11+ needs `--allow-git=all` for git sources):
 

@@ -48,6 +48,10 @@ const removePonytail = args.includes("--remove-ponytail");
 const removeRtk = args.includes("--remove-rtk");
 
 const scopeFlag = (() => {
+  // Accept both `--scope user` and `--scope=user`; the inline form used to be ignored silently,
+  // which installed user-scope when the caller asked for project-scope.
+  const inline = args.find((arg) => arg.startsWith("--scope="));
+  if (inline) return inline.slice("--scope=".length).toLowerCase() || null;
   const i = args.indexOf("--scope");
   if (i === -1) return null;
   return args[i + 1]?.toLowerCase() || null;
@@ -124,9 +128,25 @@ function parseChecksum(checksumsText, assetName) {
   return null;
 }
 
+// Every request here is one-shot, so keep-alive is off: Node's global agent pools the finished
+// socket and the process then sits alive after the last line prints (measured ~29s on Windows
+// before the shell prompt returns). A stalled connection also has to fail, not hang the install.
+const HTTP_AGENT = new https.Agent({ keepAlive: false });
+const HTTP_TIMEOUT_MS = 30000;
+
+function httpsRequest(url, onResponse) {
+  const req = https.get(
+    url,
+    { headers: { "User-Agent": "omp-supreme-token-saver" }, agent: HTTP_AGENT },
+    onResponse
+  );
+  req.setTimeout(HTTP_TIMEOUT_MS, () => req.destroy(new Error(`timed out after ${HTTP_TIMEOUT_MS}ms: ${url}`)));
+  return req;
+}
+
 async function httpsGet(url) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { "User-Agent": "omp-supreme-token-saver" } }, (res) => {
+    const req = httpsRequest(url, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
         httpsGet(new URL(res.headers.location, url).href).then(resolve).catch(reject);
@@ -143,8 +163,9 @@ async function httpsGet(url) {
 
 async function httpsDownload(url, dest) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { "User-Agent": "omp-supreme-token-saver" } }, (res) => {
+    const req = httpsRequest(url, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
         httpsDownload(new URL(res.headers.location, url).href, dest).then(resolve).catch(reject);
         return;
       }
@@ -276,7 +297,8 @@ async function ensureExtensionAfterConfigEntry(configPath, extensionPath, afterP
 // The plugin resolves its config as $XDG_CONFIG_HOME, then %APPDATA% on Windows, then ~/.config.
 // hideStatus keeps the plugin's own status row hidden: the unified one-line row from
 // shared/status-line.js is the single place a mode is displayed, so the ponytail marker no longer
-// depends on how the mode was set.
+// depends on how the mode was set. quietStartup drops the "Ponytail loaded: <mode>" toast the
+// plugin raises on session_start, which duplicated the combo row on every new session.
 function ponytailConfigDir() {
   if (process.env.XDG_CONFIG_HOME) return path.join(process.env.XDG_CONFIG_HOME, "ponytail");
   if (IS_WINDOWS) return path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"), "ponytail");
@@ -288,7 +310,7 @@ async function ensurePonytailConfig(options = {}) {
   const configPath = path.join(configDir, "config.json");
 
   if (options.dryRun) {
-    console.log(`  [dry-run] would set Ponytail hideStatus=true in ${configPath} (defaultMode=${PONYTAIL_DEFAULT_MODE} only when unset)`);
+    console.log(`  [dry-run] would set Ponytail hideStatus=true, quietStartup=true in ${configPath} (defaultMode=${PONYTAIL_DEFAULT_MODE} only when unset)`);
     return;
   }
 
@@ -310,7 +332,7 @@ async function ensurePonytailConfig(options = {}) {
   // default, so only fill defaultMode in when nothing has set one.
   const seedMode = config.defaultMode === undefined ? PONYTAIL_DEFAULT_MODE : null;
 
-  if (seedMode === null && config.hideStatus === true) {
+  if (seedMode === null && config.hideStatus === true && config.quietStartup === true) {
     debug("Ponytail config already set");
     return;
   }
@@ -318,9 +340,10 @@ async function ensurePonytailConfig(options = {}) {
   await fs.mkdir(configDir, { recursive: true });
   if (seedMode !== null) config.defaultMode = seedMode;
   config.hideStatus = true;
+  config.quietStartup = true;
   await fs.writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
 
-  console.log(`  [write] Set Ponytail defaultMode=${config.defaultMode}, hideStatus=true in ${configPath}`);
+  console.log(`  [write] Set Ponytail defaultMode=${config.defaultMode}, hideStatus=true, quietStartup=true in ${configPath}`);
 }
 
 // --- Steps ---
@@ -331,7 +354,15 @@ async function stepPonytail(pluginsDir, userDir, options = {}) {
   const pkgPath = path.join(pluginsDir, "package.json");
   let pkg = {};
   const existing = await readIfExists(pkgPath);
-  if (existing) pkg = JSON.parse(existing);
+  if (existing) {
+    try {
+      pkg = JSON.parse(existing);
+      if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) pkg = {};
+    } catch {
+      console.log(`  [warn] ${pkgPath} is not valid JSON — rewriting it`);
+      pkg = {};
+    }
+  }
 
   pkg.name = pkg.name || "omp-plugins";
   pkg.private = true;
@@ -488,6 +519,16 @@ async function stepRtk(binDir, options = {}) {
       return;
     }
 
+    // Already on the published release: skip the archive download, checksum, and extraction.
+    // Any doubt about the installed version re-downloads, so this only ever skips when certain.
+    const installedTag = await execP(binDest, ["--version"], { timeout: 10000 })
+      .then((r) => String(r.stdout).trim().split(/\s+/).pop())
+      .catch(() => null);
+    if (installedTag && tag && installedTag === String(tag).replace(/^v/, "")) {
+      console.log(`  [ok] ${binDest} → rtk ${installedTag} (already the latest release, skipping download)`);
+      return;
+    }
+
     // Also download checksums.txt for verification
     const checksumsAsset = (release.assets || []).find((a) => a.name === "checksums.txt");
     let checksumsText = null;
@@ -634,8 +675,17 @@ async function stepCaveman(extDir, options = {}) {
   const cavemanDir = path.join(extDir, "caveman-session");
   if (!options.dryRun) await fs.mkdir(cavemanDir, { recursive: true });
 
-  // Dry runs stay offline; the bundled rule is enough to preview its destination.
-  const rule = options.dryRun ? await readIfExists(path.join(path.dirname(CAVEMAN_INDEX), "rule.md")) || "" : await httpsGet(CAVEMAN_REMOTE_RULE);
+  // The bundled rule is always a valid destination: dry runs stay offline, and a failed remote
+  // fetch falls back to it instead of aborting the install with the remaining steps unrun.
+  const bundledRule = await readIfExists(path.join(path.dirname(CAVEMAN_INDEX), "rule.md")) || "";
+  let rule = bundledRule;
+  if (!options.dryRun) {
+    try {
+      rule = await httpsGet(CAVEMAN_REMOTE_RULE) || bundledRule;
+    } catch (e) {
+      console.log(`  [warn] Could not fetch ${CAVEMAN_REMOTE_RULE} (${e.message}) — using the bundled rule`);
+    }
+  }
   await writeIfChanged(path.join(cavemanDir, "rule.md"), rule, options);
 
   // Write index.js
@@ -746,7 +796,8 @@ async function runDoctor() {
       parsed = null;
     }
     const row = parsed?.hideStatus === true ? "hidden (unified row)" : "visible (duplicate row)";
-    console.log(`  Ponytail config: ok defaultMode=${parsed?.defaultMode ?? "?"}, status row ${row}`);
+    const toast = parsed?.quietStartup === true ? "quiet" : "visible (startup toast)";
+    console.log(`  Ponytail config: ok defaultMode=${parsed?.defaultMode ?? "?"}, status row ${row}, startup toast ${toast}`);
   } else {
     console.log(`  Ponytail config: MISSING ${ponytailConfigPath}`);
   }
@@ -1095,4 +1146,9 @@ async function main() {
   closeRL();
 }
 
-main().catch((e) => { closeRL(); console.error(e); });
+main().catch((e) => {
+  closeRL();
+  console.error(e);
+  // A half-finished install must not look like success to a script or install.bat.
+  process.exitCode = 1;
+});

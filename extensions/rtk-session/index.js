@@ -102,9 +102,9 @@ export default function rtkSessionExtension(pi) {
     enabled = resolveEnabled(entries);
   }
 
+  // No startup notify: the combo footer row already reports rtk: ON|OFF.
   pi.on("session_start", async (_event, ctx) => {
     restoreEnabled(ctx);
-    ctx?.ui?.notify?.(`RTK loaded: ${enabled ? "on" : "off"}`, "info");
   });
 
   pi.on("session_branch", async (_event, ctx) => {

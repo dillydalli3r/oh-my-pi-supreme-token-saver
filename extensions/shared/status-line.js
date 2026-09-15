@@ -33,6 +33,8 @@ export function renderModes(state, ctx) {
   const ui = ctx?.ui;
   if (!ui?.setStatus) return "";
   const text = statusText(state);
-  ui.setStatus(STATUS_KEY, text);
+  // An empty string is still a status: omp renders one row per status, so `""` leaves a blank
+  // footer row where the combo row used to be. `undefined` deletes the key and the row with it.
+  ui.setStatus(STATUS_KEY, text || undefined);
   return text;
 }
