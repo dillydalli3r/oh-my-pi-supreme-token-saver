@@ -1,17 +1,20 @@
 // /combo session toggle — set all three (caveman, rtk, ponytail) at once.
 // Modes: off | medium | max
 
-import os from "node:os";
-import path from "node:path";
 import { createRequire } from "node:module";
 import {
+  COMBO_DEFAULTS_FILE,
   COMBO_LEVELS,
+  clearComboDefaults,
   getSharedComboState,
   isOmpSubagentPrompt,
   normalizeComboLevel,
+  ponytailPackageFile,
+  readComboDefaults,
   reconcileSharedComboEntries,
   setSharedComboLevel,
   setSharedComboListener,
+  writeComboDefaults,
 } from "../shared/session-state.js";
 import { renderModes } from "../shared/status-line.js";
 
@@ -34,6 +37,34 @@ function levelSummary(state) {
   return `caveman=${state.caveman} rtk=${state.rtk} ponytail=${state.ponytail}`;
 }
 
+// `/combo default` accepts a preset or per-app pairs. `review` is not a ponytail default upstream
+// (#377), so it is rejected here too.
+const DEFAULT_APP_MODES = {
+  caveman: new Set(["off", "lite", "full", "ultra", "wenyan"]),
+  rtk: new Set(["off", "on"]),
+  ponytail: new Set(["off", "lite", "full", "ultra"]),
+};
+
+function parseDefaultModes(text) {
+  const modes = {};
+  for (const token of String(text).split(/[\s,]+/).filter(Boolean)) {
+    const [rawName, rawMode] = token.split("=");
+    const app = String(rawName || "").trim().toLowerCase();
+    const mode = String(rawMode || "").trim().toLowerCase();
+    if (!DEFAULT_APP_MODES[app]?.has(mode)) return null;
+    modes[app] = mode;
+  }
+  return Object.keys(modes).length ? modes : null;
+}
+
+const DEFAULT_USAGE = [
+  "Usage: /combo default [off|medium|max | app=mode ... | reset]",
+  "  /combo default                     show what new sessions start from",
+  "  /combo default medium              new sessions start at medium",
+  "  /combo default caveman=lite rtk=off ponytail=full",
+  "  /combo default reset               drop the override (back to max)",
+].join("\n");
+
 function hasPonytailInstructions(systemPrompt) {
   const prompts = Array.isArray(systemPrompt) ? systemPrompt : [systemPrompt];
   return prompts.some((prompt) => typeof prompt === "string" && prompt.includes("PONYTAIL MODE ACTIVE"));
@@ -41,20 +72,21 @@ function hasPonytailInstructions(systemPrompt) {
 
 function loadPonytailInstructions(mode) {
   try {
-    const installed = path.join(
-      os.homedir(),
-      ".omp",
-      "plugins",
-      "node_modules",
-      "@dietrichgebert",
-      "ponytail",
-      "hooks",
-      "ponytail-instructions.js"
-    );
-    const { getPonytailInstructions } = require(installed);
+    const { getPonytailInstructions } = require(ponytailPackageFile("hooks/ponytail-instructions.js"));
     if (typeof getPonytailInstructions === "function") return getPonytailInstructions(mode);
   } catch {}
   return ponytailFallback(mode);
+}
+
+// Ponytail's plugin owns the ponytail default, so `/combo default` writes through its own API
+// instead of a second config file. Returns false when the plugin is missing (skill-only install).
+function syncPonytailDefault(mode) {
+  try {
+    require(ponytailPackageFile("hooks/ponytail-config.js")).writeDefaultMode(mode);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export default function comboToggleExtension(pi) {
@@ -105,9 +137,53 @@ export default function comboToggleExtension(pi) {
     if (ctx?.hasUI) setSharedComboListener((state) => useState(state));
   }
 
+  // Persisted defaults only steer sessions that start without combo entries; the running session is
+  // left alone so a user can keep an exception session without losing their default.
+  function applyDefault(arg, ctx) {
+    if (!arg) {
+      const defaults = readComboDefaults();
+      ctx?.ui?.notify?.(
+        `Combo default for new sessions: ${defaults.level.toUpperCase()} (${levelSummary(defaults)})\n` +
+        `File: ${COMBO_DEFAULTS_FILE}\n${DEFAULT_USAGE}`,
+        "info"
+      );
+      return;
+    }
+
+    if (arg === "reset") {
+      clearComboDefaults();
+      syncPonytailDefault(COMBO_LEVELS.max.ponytail);
+      const defaults = readComboDefaults();
+      ctx?.ui?.notify?.(
+        `Combo default reset to ${defaults.level.toUpperCase()} (${levelSummary(defaults)}) for new sessions.`,
+        "info"
+      );
+      return;
+    }
+
+    const level = normalizeComboLevel(arg);
+    const modes = level ? COMBO_LEVELS[level] : parseDefaultModes(arg);
+    if (!modes) {
+      ctx?.ui?.notify?.(DEFAULT_USAGE, "warning");
+      return;
+    }
+
+    writeComboDefaults(modes);
+    // Push ponytail only when this call set it: a caveman/rtk-only default must not overwrite a
+    // ponytail default the user chose with /ponytail default.
+    const synced = modes.ponytail === undefined || syncPonytailDefault(modes.ponytail);
+    const defaults = readComboDefaults();
+    ctx?.ui?.notify?.(
+      `Combo default for new sessions: ${defaults.level.toUpperCase()} (${levelSummary(defaults)})` +
+      `${synced ? "" : "\n[pending] Ponytail plugin not found — its own default was not synced."}\n` +
+      "Current session unchanged; /combo off|medium|max applies a level now.",
+      "info"
+    );
+  }
+
 
   pi.registerCommand("combo", {
-    description: "Toggle all 3 OMP add-ons at once. Usage: /combo <off|medium|max|status>",
+    description: "Toggle all 3 OMP add-ons at once. Usage: /combo <off|medium|max|status|default>",
     handler: async (args, ctx) => {
       listen(ctx);
       const arg = String(args || "").trim().toLowerCase();
@@ -115,7 +191,8 @@ export default function comboToggleExtension(pi) {
       if (!arg || arg === "status") {
         const state = reconcile(ctx);
         ctx?.ui?.notify?.(
-          `Combo: ${state.level.toUpperCase()} (${levelSummary(state)})`,
+          `Combo: ${state.level.toUpperCase()} (${levelSummary(state)})` +
+          ` · default for new sessions: ${readComboDefaults().level.toUpperCase()}`,
           "info"
         );
         return;
@@ -123,18 +200,25 @@ export default function comboToggleExtension(pi) {
 
       if (arg === "help") {
         ctx?.ui?.notify?.(
-          "/combo off    — disables all 3 (caveman, rtk, ponytail)\n" +
-          "/combo medium — light: caveman=lite, rtk=on, ponytail=lite\n" +
-          "/combo max    — aggressive: caveman=ultra, rtk=on, ponytail=ultra",
+          "/combo off      — disables all 3 (caveman, rtk, ponytail)\n" +
+          "/combo medium   — light: caveman=lite, rtk=on, ponytail=lite\n" +
+          "/combo max      — aggressive: caveman=ultra, rtk=on, ponytail=ultra\n" +
+          "/combo default  — change the level new sessions start from\n" +
+          "/combo status   — show the current level and the default",
           "info"
         );
+        return;
+      }
+
+      if (arg === "default" || arg.startsWith("default ")) {
+        applyDefault(arg.slice("default".length).trim(), ctx);
         return;
       }
 
       const level = normalizeComboLevel(arg);
       if (!level) {
         ctx?.ui?.notify?.(
-          `Unknown combo level: ${arg}. Use: off | medium | max`,
+          `Unknown combo level: ${arg}. Use: off | medium | max, or /combo default ...`,
           "warning"
         );
         return;

@@ -6,7 +6,7 @@ Fork of [`@fernado03/oh-my-pi-supreme-token-saver`](https://www.npmjs.com/packag
 
 | Change | Before | Now |
 |---|---|---|
-| Session default | every mode off until you enable it | a fresh session behaves like `/combo max` (caveman `ultra`, RTK on, ponytail `ultra`); `/combo off` still opts a session out |
+| Session default | every mode off until you enable it | a fresh session behaves like `/combo max` (caveman `ultra`, RTK on, ponytail `ultra`); `/combo default <level\|app=mode>` changes what fresh sessions start from, and `/combo off` still opts one session out |
 | Status bar | one footer row per add-on, and the ponytail row used a different marker per mode (`🔥`/`⚡`/`🌿`) | a **single** row for all three: `🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA` — the marker per app is fixed and does not depend on whether the mode came from `/combo`, a per-app command, or the session default |
 | Ponytail config path | installer wrote `~/.config/ponytail/config.json`, which the plugin does not read on Windows | installer writes the path the plugin actually resolves (`$XDG_CONFIG_HOME`, then `%APPDATA%`, then `~/.config`) and sets `hideStatus: true` so the plugin does not add a second, competing row |
 
@@ -28,7 +28,7 @@ npx --yes --allow-git=all github:dillydalli3r/oh-my-pi-supreme-token-saver insta
 
 The installer copies the bundled extensions into `~/.omp/agent/extensions`, registers them in `~/.omp/agent/config.yml`, installs the Ponytail plugin (`github:DietrichGebert/ponytail`) and the RTK binary, and pins the Ponytail defaults above. `--dry-run` previews every write; `doctor` verifies the result afterwards.
 
-**After install:** restart OMP. New sessions start at `max`; `/combo medium`, `/combo off`, or the individual toggles change it per session.
+**After install:** restart OMP. New sessions start at `max`; `/combo medium`, `/combo off`, or the individual toggles change it per session, and `/combo default <level>` changes what fresh sessions start from.
 
 Individual toggles: `/caveman ultra` · `/rtk on` · `/ponytail ultra`
 
@@ -45,7 +45,7 @@ Individual toggles: `/caveman ultra` · `/rtk on` · `/ponytail ultra`
 | **Combo** | Switches Caveman, RTK, and Ponytail together. Presets: `off`, `medium`, and `max`; mixed individual modes display as `custom` |
 | **Amanai reward detector** | Locally notifies you when a final successful response contains a footer-shaped `AMANAI-GACHA-…` key; it never changes output, stores or sends the key, redeems it, opens a browser, or creates requests |
 
-All three token-saving modes start at `max` (the session default). `/combo off` disables them for the current session.
+All three token-saving modes start at `max` (the session default); `/combo default <level>` changes what fresh sessions start from, and `/combo off` disables them for the current session.
 
 For long sessions, the package reasserts active modes after Ponytail's prompt block on every top-level turn, including after OMP compacts earlier history.
 
@@ -131,16 +131,31 @@ rtk lint
 ### Combo — toggle all three
 
 ```text
-/combo off            all three off (default)
-/combo medium         caveman=lite, rtk=on, ponytail=lite
-/combo max            caveman=ultra, rtk=on, ponytail=ultra
-/combo status         show the level and underlying modes
-/combo help           show available levels
+/combo off                          all three off for this session
+/combo medium                       caveman=lite, rtk=on, ponytail=lite
+/combo max                          caveman=ultra, rtk=on, ponytail=ultra
+/combo status                       show the level, the underlying modes, and the default
+/combo help                         show available levels
+/combo default                      show the level fresh sessions start from
+/combo default off|medium|max       set what fresh sessions start from
+/combo default caveman=lite rtk=off ponytail=full
+/combo default reset                 drop the override (back to max)
 ```
 
 `/combo` persists each add-on's state and reloads OMP so the new modes apply immediately, without emitting separate `/caveman`, `/rtk`, or `/ponytail` command messages.
 
 Active Combo presets are inherited by OMP task subagents created from the session. `/combo medium` or `/combo max` is the only way to activate a preset and show the Combo footer indicator. Individual `/caveman`, `/rtk`, and `/ponytail` commands leave Combo inactive; `/combo status` reports their actual mixed state without turning the indicator on.
+
+### Combo defaults — what a fresh session starts from
+
+Every session that has no combo entry yet starts from the stored defaults: built-in `max` until you change them.
+
+- `/combo default <level>` writes the preset; `/combo default caveman=lite rtk=off ponytail=full` pins single apps and displays as `custom`. Unpinned apps keep their built-in default.
+- The running session is never changed by `default` — `/combo off|medium|max` applies a level now.
+- Defaults persist in `~/.omp/agent/combo-defaults.json` (override the path with `OMP_COMBO_DEFAULTS_FILE`). Only keys you set are written, so a caveman-only default never pins ponytail.
+- Ponytail keeps its own default: `/combo default` also calls the plugin's `writeDefaultMode`, and `PONYTAIL_DEFAULT_MODE` still outranks it. `/ponytail status` shows `current <mode> • default <mode>`, and `/combo default` reports the value that actually runs.
+- `ponytail=review` is refused: review is session-only upstream. `/combo default reset` clears the file and returns ponytail to `ultra`.
+- `install` fills ponytail's `defaultMode` only when nothing has set one, so reinstalling does not undo a default you chose in-session.
 
 ## File locations
 
@@ -153,6 +168,7 @@ Active Combo presets are inherited by OMP task subagents created from the sessio
 | Combo extension | `~/.omp/agent/extensions/combo-toggle/` |
 | Amanai detector extension | `~/.omp/agent/extensions/amanai-reward/` |
 | RTK binary | `~/.bun/bin/rtk` (`rtk.exe` on Windows) |
+| Combo session defaults | `~/.omp/agent/combo-defaults.json` |
 | Explicit extension registrations | `~/.omp/agent/config.yml` |
 
 ## Backups
@@ -192,6 +208,10 @@ npm exec --yes --prefer-online --package=@dillydalli3r/oh-my-pi-supreme-token-sa
 ### Ponytail or Combo command is missing
 
 Run `oh-my-pi-supreme-token-saver reinstall` in the same Windows, WSL, or Linux environment where OMP runs, restart OMP, then try `/ponytail status` and `/combo status`. If either is still missing, run `oh-my-pi-supreme-token-saver doctor`; the installer normally repairs both explicit registrations in `~/.omp/agent/config.yml`.
+
+### A combo default does not apply to a new session
+
+Run `/combo default` to see the stored default and its file path, then `/combo status` in the new session. A session that already has a combo entry keeps its own level — only sessions with no entry start from the default. If ponytail's mode still differs from the reported default, `PONYTAIL_DEFAULT_MODE` is set in the environment and outranks the config file; `/ponytail status` shows both values.
 
 ### RTK is missing or not executable
 

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { getSharedComboState, isOmpSubagentPrompt, setSharedComboMode } from "../shared/session-state.js";
+import { getSharedComboState, isOmpSubagentPrompt, readComboDefaults, setSharedComboMode } from "../shared/session-state.js";
 
 const CAVERN_DIR = dirname(fileURLToPath(import.meta.url));
 const RULE_PATH = join(CAVERN_DIR, "rule.md");
@@ -22,7 +22,6 @@ function readFullRule() {
   try { return readFileSync(RULE_PATH, "utf8"); } catch { return FALLBACK_FULL_RULE; }
 }
 
-const DEFAULT_MODE = "ultra";
 const MODES = new Set(["off", "lite", "full", "ultra", "wenyan"]);
 
 const INSTRUCTIONS = {
@@ -40,7 +39,7 @@ function normalizeMode(value) {
   return MODES.has(mode) ? mode : null;
 }
 
-function resolveMode(entries, fallback = DEFAULT_MODE) {
+function resolveMode(entries, fallback = readComboDefaults().caveman) {
   if (!Array.isArray(entries)) return fallback;
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const entry = entries[i];
@@ -57,7 +56,7 @@ function isOffCommand(text) {
 }
 
 export default function cavemanSessionExtension(pi) {
-  let currentMode = DEFAULT_MODE;
+  let currentMode = readComboDefaults().caveman;
 
   function setMode(mode, ctx) {
     const normalized = normalizeMode(mode);

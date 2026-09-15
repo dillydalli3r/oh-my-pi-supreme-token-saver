@@ -1,7 +1,7 @@
 {
   "name": "@dillydalli3r/oh-my-pi-supreme-token-saver",
-  "version": "1.4.0",
-  "description": "Amanai reward detector and three toggleable OMP extensions for terse replies, compact shell output, and minimal code decisions — with a manual updater, a single unified status row, and a combo-max session default.",
+  "version": "1.4.1",
+  "description": "Amanai reward detector and three toggleable OMP extensions for terse replies, compact shell output, and minimal code decisions — with a manual updater, a single unified status row, and adjustable session defaults (combo max by default).",
   "keywords": [
     "omp",
     "oh-my-pi",

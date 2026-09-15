@@ -286,7 +286,7 @@ async function ensurePonytailConfig(options = {}) {
   const configPath = path.join(configDir, "config.json");
 
   if (options.dryRun) {
-    console.log(`  [dry-run] would set Ponytail defaultMode=${PONYTAIL_DEFAULT_MODE}, hideStatus=true in ${configPath}`);
+    console.log(`  [dry-run] would set Ponytail hideStatus=true in ${configPath} (defaultMode=${PONYTAIL_DEFAULT_MODE} only when unset)`);
     return;
   }
 
@@ -304,17 +304,21 @@ async function ensurePonytailConfig(options = {}) {
     }
   }
 
-  if (config.defaultMode === PONYTAIL_DEFAULT_MODE && config.hideStatus === true) {
+  // A default chosen in-session (`/ponytail default`, `/combo default`) outranks the install
+  // default, so only fill defaultMode in when nothing has set one.
+  const seedMode = config.defaultMode === undefined ? PONYTAIL_DEFAULT_MODE : null;
+
+  if (seedMode === null && config.hideStatus === true) {
     debug("Ponytail config already set");
     return;
   }
 
   await fs.mkdir(configDir, { recursive: true });
-  config.defaultMode = PONYTAIL_DEFAULT_MODE;
+  if (seedMode !== null) config.defaultMode = seedMode;
   config.hideStatus = true;
   await fs.writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
 
-  console.log(`  [write] Set Ponytail defaultMode=${PONYTAIL_DEFAULT_MODE}, hideStatus=true in ${configPath}`);
+  console.log(`  [write] Set Ponytail defaultMode=${config.defaultMode}, hideStatus=true in ${configPath}`);
 }
 
 // --- Steps ---
@@ -681,7 +685,7 @@ async function runDoctor() {
   console.log("\n=== OMP Supreme Token Saver Doctor ===\n");
 
   // Node
-  console.log(`  Node: ok v${process.version}`);
+  console.log(`  Node: ok ${process.version}`);
 
   // OMP CLI
   try {
@@ -774,6 +778,19 @@ async function runDoctor() {
   // Combo
   const comboIndex = path.join(extDir, "combo-toggle", "index.js");
   console.log(`  Combo extension: ${(await readIfExists(comboIndex)) !== null ? "installed" : "MISSING"}`);
+
+  const comboDefaultsPath = path.join(agentDir, "combo-defaults.json");
+  const comboDefaultsRaw = await readIfExists(comboDefaultsPath);
+  let comboDefault = "max (built-in)";
+  if (comboDefaultsRaw) {
+    try {
+      const parsed = JSON.parse(comboDefaultsRaw.replace(/^\uFEFF/, ""));
+      comboDefault = `caveman=${parsed?.caveman ?? "ultra"} rtk=${parsed?.rtk ?? "on"} ponytail=${parsed?.ponytail ?? "max default"}`;
+    } catch {
+      comboDefault = `unreadable ${comboDefaultsPath}`;
+    }
+  }
+  console.log(`  Combo session default: ${comboDefault}`);
 
   const modeReinforcement = path.join(extDir, "shared", "mode-reinforcement.js");
   console.log(`  Mode reinforcement extension: ${(await readIfExists(modeReinforcement)) !== null ? "installed" : "MISSING"}`);
@@ -1050,7 +1067,8 @@ async function main() {
   console.log("  3. /rtk on");
   console.log("  4. /ponytail full");
   console.log("  5. /ai-addons check");
-  console.log("  6. /combo medium   (toggle all 3 at once — off by default)");
+  console.log("  6. /combo max   (all 3 at once; fresh sessions already start at max)");
+  console.log("  7. /combo default   (change what new sessions start from)");
 
   closeRL();
 }

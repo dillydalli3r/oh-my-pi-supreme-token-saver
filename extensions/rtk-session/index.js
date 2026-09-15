@@ -1,17 +1,19 @@
 import os from "node:os";
 import path from "node:path";
-import { getSharedComboState, isOmpSubagentPrompt, setSharedComboMode } from "../shared/session-state.js";
+import { getSharedComboState, isOmpSubagentPrompt, readComboDefaults, setSharedComboMode } from "../shared/session-state.js";
 
-const DEFAULT_ENABLED = true;
+function defaultEnabled() {
+  return readComboDefaults().rtk === "on";
+}
 
-function asBoolean(value, fallback = DEFAULT_ENABLED) {
+function asBoolean(value, fallback = defaultEnabled()) {
   if (typeof value === "boolean") return value;
   if (value === "on" || value === "true") return true;
   if (value === "off" || value === "false") return false;
   return fallback;
 }
 
-function resolveEnabled(entries, fallback = DEFAULT_ENABLED) {
+function resolveEnabled(entries, fallback = defaultEnabled()) {
   if (!Array.isArray(entries)) return fallback;
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const entry = entries[i];
@@ -31,7 +33,7 @@ Do not use RTK when exact raw output is required, when a specialized OMP tool is
 
 export default function rtkSessionExtension(pi) {
   const { z } = pi.zod;
-  let enabled = DEFAULT_ENABLED;
+  let enabled = defaultEnabled();
 
   function setEnabled(next, ctx) {
     enabled = Boolean(next);
