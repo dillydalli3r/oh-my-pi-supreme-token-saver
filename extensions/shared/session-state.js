@@ -42,7 +42,10 @@ export const KNOBS = Object.freeze({
   // started, which is why no preset turns it on — a preset is a token dial, not a licence to spawn a
   // proxy on a machine that may not even have headroom installed.
   headroom: Object.freeze(["off", "on"]),
-  status: Object.freeze(["off", "preset", "compact", "names", "full"]),
+  // The row's shape. `full` is the default and the narrow one (icon + short value per knob), `names`
+  // spells the same knobs out; a third letter-based shape would have been a second rendering of
+  // `full`, so there is none.
+  status: Object.freeze(["off", "preset", "names", "full"]),
 });
 
 export const MODE_KNOBS = Object.freeze(Object.keys(KNOBS));

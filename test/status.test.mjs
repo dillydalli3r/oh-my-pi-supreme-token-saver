@@ -70,10 +70,11 @@ const withoutPonytailPlugin = async (run) => {
 const SUBAGENT_PROMPT = "You are operating on a piece of work assigned to you by the main agent.";
 const SUBAGENT_TAIL = "Do not weaken or disable a mode unless the main agent asks for it.";
 
-// The built-in default session, rendered: preset marker plus all nine knob segments.
-const MAX_ROW = "🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🔁 auto: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: FULL · ⏱️ threshold: FULL · 🔀 headroom: OFF";
+// The built-in default session, rendered: the preset word plus every knob, grouped by layer.
+const MAX_ROW = "🧩 MAX · 🦴U 🦀ON 🔁ON 🐴U · 📖F 🗜️F 🧹F ⏱️70% · 🔀OFF";
 
-// One row segment per knob except `status`, which is the knob that picks the row's shape.
+// One row token per knob, plus the preset's two (`🧩`, the preset name): the row groups its knobs, so
+// the group separators are not segments and the tokens are what a knob-per-knob assertion counts.
 const MODE_KNOB_COUNT = 9;
 
 const EXTENSION_FILES = [
@@ -87,6 +88,9 @@ const EXTENSION_FILES = [
 const ALL_EXEC = [];
 
 const segments = (row) => String(row).split(" · ");
+// The row's groups are ` · `-separated and a knob inside a group is space-separated, so the tokens
+// are the knobs plus the preset's own two words (`🧩`, `MAX`).
+const tokens = (row) => segments(row).flatMap((part) => part.split(" "));
 const occurrences = (text, needle) => String(text).split(needle).length - 1;
 
 function zodStub() {
@@ -250,7 +254,7 @@ test("a fresh session renders one row: the default preset with every knob segmen
 
   assert.deepEqual(rt.keys(), ["modes"], "the pack owns one status row");
   assert.equal(rt.row(), MAX_ROW);
-  assert.equal(segments(rt.row()).length, MODE_KNOB_COUNT + 1, "preset marker + one segment per knob");
+  assert.equal(tokens(rt.row()).length, MODE_KNOB_COUNT + 2, "preset marker + preset name + one token per knob");
 });
 
 test("session start is silent: no add-on announces itself loading", async () => {
@@ -318,10 +322,10 @@ test("a per-knob override changes only its segments, derives CUSTOM, and replays
 
   assert.equal(
     after,
-    "🧩 CUSTOM · 🦴 caveman: WENYAN · 🦀 rtk: ON · 🔁 auto: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: OFF · ⏱️ threshold: FULL · 🔀 headroom: OFF"
+    "🧩 CUSTOM · 🦴W 🦀ON 🔁ON 🐴U · 📖F 🗜️F 🧹O ⏱️70% · 🔀OFF"
   );
-  const changed = segments(after).filter((part, index) => part !== segments(before)[index]);
-  assert.deepEqual(changed, ["🧩 CUSTOM", "🦴 caveman: WENYAN", "🧹 prune: OFF"]);
+  const changed = tokens(after).filter((part, index) => part !== tokens(before)[index]);
+  assert.deepEqual(changed, ["CUSTOM", "🦴W", "🧹O"], "only the two knob tokens and the preset word moved");
 
   const replay = await createRuntime(rt.entries);
   await replay.start();
@@ -363,7 +367,7 @@ test("a per-knob default derives a custom default and reports the ponytail sync 
 
   const fresh = await createRuntime();
   await fresh.start();
-  assert.match(fresh.row(), /^🧩 CUSTOM · 🦴 caveman: WENYAN · /);
+  assert.match(fresh.row(), /^🧩 CUSTOM · 🦴W /);
 
   await withoutPonytailPlugin(async () => {
     await rt.run("ts", "default ponytail=full");
@@ -389,7 +393,7 @@ test("status=off deletes the row while the other knobs stay applied", async () =
 
   await rt.run("ts", "set status=full");
   assert.deepEqual(rt.keys(), ["modes"]);
-  assert.match(rt.row(), /🦴 caveman: LITE/);
+  assert.match(rt.row(), /🦴L/);
 });
 
 test("subagent prompts inherit the caveman and rtk blocks", async () => {
@@ -425,8 +429,9 @@ test("nothing is appended when every knob is off", async () => {
   assert.equal(prompt, SUBAGENT_PROMPT, "no mode is active, so no instruction is injected");
 });
 
-// Four row shapes, because a footer can be narrower than nine segments: `names` is the one that
-// says what each tool is set to without an icon to decode, `preset` is one word.
+// Four row shapes, because a footer can be narrower than nine knobs: `full` is the one that fits
+// (icon + short value, grouped), `names` spells the same knobs out for when a letter would not be
+// clear, and `preset` drops them for one word.
 test("the status knob picks the row's shape", async () => {
   const rt = await createRuntime();
   await rt.start();
@@ -434,18 +439,17 @@ test("the status knob picks the row's shape", async () => {
   await rt.run("ts", "set status=names");
   assert.equal(
     rt.row(),
-    "🧩 MAX · caveman: ULTRA · rtk: ON · auto: ON · ponytail: ULTRA · read: FULL · compress: FULL · prune: FULL · threshold: FULL · headroom: OFF"
+    "🧩 MAX · caveman ultra · rtk on · autoRtk on · ponytail ultra · read full · compress full · prune full · threshold full (70%) · headroom off"
   );
   assert.equal(rt.row().includes("🦴"), false, "no icon is left to decode");
+  assert.equal(rt.row().includes(":"), false, "the knob's name and its value are two words, not a label");
 
   await rt.run("ts", "set status=preset");
   assert.equal(rt.row(), "🧩 MAX");
 
-  await rt.run("ts", "set status=compact");
-  assert.equal(rt.row(), "🧩 MAX · 🦴U · 🦀ON · 🔁ON · 🐴U · 📖F · 🗜️F · 🧹F · ⏱️F · 🔀OFF");
-
   await rt.run("ts", "set status=full");
   assert.equal(rt.row(), MAX_ROW);
+  assert.equal(segments(rt.row()).length, 4, "the preset plus one group per layer, not one segment per knob");
 });
 
 // A display-only knob must not demote the session: `custom` would also drop the preset's native tier
@@ -471,16 +475,16 @@ test("the rtk knob accepts the same vocabulary /ts set rtk= does, and nothing el
   await rt.start();
 
   await rt.run("rtk", "on");
-  assert.match(rt.row(), /🦀 rtk: ON/);
+  assert.match(rt.row(), /🦀ON/);
 
   await rt.run("rtk", "off");
-  assert.match(rt.row(), /🦀 rtk: OFF/);
+  assert.match(rt.row(), /🦀OFF/);
 
   // `true`/`false` are the boolean spelling of the same two states, not a third vocabulary.
   await rt.run("rtk", "true");
-  assert.match(rt.row(), /🦀 rtk: ON/);
+  assert.match(rt.row(), /🦀ON/);
   await rt.run("rtk", "false");
-  assert.match(rt.row(), /🦀 rtk: OFF/);
+  assert.match(rt.row(), /🦀OFF/);
 
   const running = rt.row();
   await rt.run("rtk", "enable");
@@ -785,7 +789,7 @@ test("a second session in one process does not republish over the live state", a
   await first.start();
   await first.run("ts", "set caveman=off");
   const row = first.row();
-  assert.match(row, /^🧩 CUSTOM · 🦴 caveman: OFF · /);
+  assert.match(row, /^🧩 CUSTOM · 🦴O /);
 
   const second = await createRuntime([], EXTENSION_FILES, { sessionId: "session-2" });
   await second.start();
@@ -850,7 +854,7 @@ test("/ts set accepts a camelCase knob typed in any case", async () => {
   await rt.start();
 
   await rt.run("ts", "set autoRtk=off");
-  assert.match(rt.row(), /🔁 auto: OFF/);
+  assert.match(rt.row(), /🔁OFF/);
   assert.deepEqual(
     rt.entries.filter((entry) => entry.customType === "ts-mode").map((entry) => entry.data),
     [{ name: "autoRtk", value: "off" }],
@@ -858,7 +862,7 @@ test("/ts set accepts a camelCase knob typed in any case", async () => {
   );
 
   await rt.run("ts", "set AUTORTK=on");
-  assert.match(rt.row(), /🔁 auto: ON/);
+  assert.match(rt.row(), /🔁ON/);
 });
 
 test("/combo keeps the pre-2.0 default verb and refuses the newer knobs", async () => {
@@ -1199,6 +1203,34 @@ test("the threshold knob's level picks the compaction trigger keys", async () =>
   assert.deepEqual(percent.args.slice(at, at + 6), ["config", "set", "compaction.thresholdPercent", "--json", "--", "-1"]);
 });
 
+// The row's number and the percent a level writes are one fact living in two files (status-line.js /
+// the threshold table above), so this pins them together: a retuned level must not leave the row
+// saying `threshold ultra (55%)` while nothing sets 55.
+test("the row's threshold note is the percent that level writes", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  stubOmp(rt);
+  await rt.run("ts", "native on");
+  // The spelled shape, because it carries the level *and* the number: the default row shows the
+  // number alone.
+  await rt.run("ts", "set status=names");
+
+  // The shared state is one per process, so an earlier test may have left `threshold` on the very
+  // level under test — and a `set` that changes nothing writes nothing. Step onto the next level
+  // first, then clear: what the second `set` writes is the diff this level alone is responsible for.
+  const levels = ["off", "lite", "full", "ultra"];
+  for (const [index, level] of levels.entries()) {
+    await rt.run("ts", `set threshold=${levels[(index + 1) % levels.length]}`);
+    rt.clearExecCalls();
+    await rt.run("ts", `set threshold=${level}`);
+    const written = nativeWrites(rt).find((key) => key.startsWith("compaction.thresholdPercent="));
+    const percent = written.slice("compaction.thresholdPercent=".length);
+    // `-1` is the host saying "no share of my own" — the reserve decides, and the row says so.
+    const note = percent === "-1" ? "reserve" : `${percent}%`;
+    assert.match(rt.row(), new RegExp(`threshold ${level} \\(${note}\\)`), `${level}: ${rt.row()}`);
+  }
+});
+
 // `prune` used to switch idle compaction on while the token trigger stayed at its 200000 default —
 // at or above the whole window of many models, so the setting could never fire. The trigger family
 // belongs to `threshold` alone now, and this pins that prune writes none of it. The native gate is
@@ -1335,13 +1367,13 @@ test("/ts config configures the footer row and previews each shape", async () =>
 
   await rt.run("ts", "config");
   assert.equal(asked[0], "menu", "the row entry is on the top level, not only under Knob");
-  assert.deepEqual(asked[1], ["off", "preset", "compact", "names", "full"]);
+  assert.deepEqual(asked[1], ["off", "preset", "names", "full"]);
   assert.match(
     asked[2],
-    /^every tool spelled out, no icons — 🧩 MAX · caveman: ULTRA · rtk: ON · auto: ON · ponytail: ULTRA/,
+    /^every knob spelled out: its name and its level, no icons — 🧩 MAX · caveman ultra · rtk on/,
     "the description is the row this shape would render, not a second template"
   );
-  assert.match(rt.row(), /^🧩 MAX · caveman: ULTRA · rtk: ON · auto: ON · ponytail: ULTRA · read: FULL/);
+  assert.match(rt.row(), /^🧩 MAX · caveman ultra · rtk on · autoRtk on · ponytail ultra · read full/);
 });
 
 // A config file that does not parse must not be replaced by the next write: reading it yields the
@@ -1364,19 +1396,25 @@ test("a hand-broken config is refused, not overwritten", async () => {
 });
 
 // The row is built from the knob table, so a knob added there cannot be missing from every shape.
-// `status` is the one legitimate exclusion: it picks the shape, so it cannot be a segment of it.
-test("every knob in the table has a segment in the row, except the shape knob", async () => {
+// `status` is the one legitimate exclusion: it picks the shape, so it cannot be a token of it. Both
+// value shapes are checked: the default row shows every knob's marker, `names` shows every knob's
+// name — a knob with neither is a knob nobody can see.
+test("every knob in the table has a marker in the row, except the shape knob", async () => {
   const { KNOBS, MODE_KNOBS } = await import(pathToFileURL(join(EXT, "shared", "session-state.js")).href);
   const rt = await createRuntime();
   await rt.start();
 
-  const row = rt.row();
   const expected = MODE_KNOBS.filter((knob) => knob !== "status");
+  await rt.run("ts", "set status=full");
+  const short = rt.row();
+  assert.equal(tokens(short).length, expected.length + 2, "preset marker + preset name + one token per knob");
+
+  await rt.run("ts", "set status=names");
+  const spelled = rt.row();
   for (const knob of expected) {
     assert.ok(KNOBS[knob], `${knob} is a knob`);
-    assert.ok(row.includes(knob === "autoRtk" ? "auto:" : `${knob}:`), `${knob} appears in the row`);
+    assert.ok(spelled.includes(`${knob} `), `${knob} appears in the spelled row`);
   }
-  assert.equal(segments(row).length, expected.length + 1, "preset marker plus one segment per knob");
 });
 
 // An option value no verb would accept is not obeyed either: honoring it would make the gate read one
@@ -1397,11 +1435,11 @@ test("/ts set headroom=on routes the session and shows it on the row", async () 
     config: { openai_api_url: DEEPSEEK.baseUrl },
   });
   assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787, "the provider is on the proxy");
-  assert.match(rt.row(), /🔀 headroom: ON/);
+  assert.match(rt.row(), /🔀ON/);
 
   await rt.run("ts", "set headroom=off");
   assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl, "the provider is back on its own endpoint");
-  assert.match(rt.row(), /🔀 headroom: OFF/);
+  assert.match(rt.row(), /🔀OFF/);
 });
 
 // Every preset carries headroom=off, so applying one on a routed session unroutes it: the knob is part
@@ -1412,11 +1450,11 @@ test("a preset turns the headroom knob off and unroutes", async () => {
   await withProxyHealth(() => rt.run("ts", "set headroom=on"), {
     config: { openai_api_url: DEEPSEEK.baseUrl },
   });
-  assert.match(rt.row(), /🔀 headroom: ON/);
+  assert.match(rt.row(), /🔀ON/);
 
   await rt.run("ts", "preset max");
   assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl);
-  assert.match(rt.row(), /🔀 headroom: OFF/);
+  assert.match(rt.row(), /🔀OFF/);
 });
 
 // A resumed session was routed by a process that has since ended: the entry still says `on`, so the
@@ -1431,7 +1469,7 @@ test("a session that was left routed re-wraps on session start", async () => {
   }, { config: { openai_api_url: DEEPSEEK.baseUrl } });
 
   assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787, "the wiring is back");
-  assert.match(rt.row(), /🔀 headroom: ON/);
+  assert.match(rt.row(), /🔀ON/);
 });
 
 // A preset speaks about behaviour; the row's shape is a preference the user set. Applying one must not
@@ -1443,7 +1481,7 @@ test("no preset touches the row's shape", async () => {
   await rt.run("ts", "set status=names");
   for (const preset of ["off", "lite", "medium", "high", "max", "ultra"]) {
     await rt.run("ts", `preset ${preset}`);
-    assert.match(rt.row(), /^🧩 [A-Z]+ · caveman: [A-Z]+ · /, `${preset} still spells the tools out`);
+    assert.match(rt.row(), /^🧩 [A-Z]+ · caveman [a-z]+ · /, `${preset} still spells the tool out`);
     assert.equal(rt.row().includes("🦴"), false, `${preset} kept the icon-free shape`);
   }
 
@@ -1456,16 +1494,34 @@ test("no preset touches the row's shape", async () => {
 test("the row's shape stores as a preference and is replayed from the session", async () => {
   const rt = await createRuntime();
   await rt.start();
-  await rt.run("ts", "default status=compact");
+  await rt.run("ts", "default status=names");
 
   const { readConfig } = await import(pathToFileURL(join(EXT, "shared", "session-state.js")).href);
-  assert.equal(readConfig().modes.status, "compact", "a new session resolves the stored shape");
+  assert.equal(readConfig().modes.status, "names", "a new session resolves the stored shape");
   assert.equal(readConfig().preset, "max", "a shape preference is not a behaviour, so the preset stands");
 
-  const branch = [{ type: "custom", customType: "ts-mode", data: { name: "status", value: "compact" }, id: "e1" }];
+  const branch = [{ type: "custom", customType: "ts-mode", data: { name: "status", value: "names" }, id: "e1" }];
   const replayed = await createRuntime(branch);
   await replayed.start();
-  assert.match(replayed.row(), /^🧩 MAX · 🦴U · 🦀ON · 🔁ON · /, "the branch replays the shape it was left with");
+  assert.match(replayed.row(), /^🧩 MAX · caveman ultra · /, "the branch replays the shape it was left with");
+});
+
+// `compact` was retired with the overhaul: the default `full` row is now the narrow one, so a stored
+// or branched `compact` is not a shape any more. It must fall back to the default, not throw, and not
+// resurrect a third rendering.
+test("a retired shape falls back to the default instead of breaking the row", async () => {
+  const retired = await createRuntime([
+    { type: "custom", customType: "ts-mode", data: { name: "status", value: "compact" }, id: "e1" },
+  ]);
+  const bare = await createRuntime();
+  await retired.start();
+  await bare.start();
+  assert.equal(retired.row(), bare.row(), "a retired shape renders exactly what no shape renders");
+
+  const before = retired.row();
+  await retired.run("ts", "set status=compact");
+  assert.match(retired.notifications.at(-1).text, /Invalid value for status: compact\. Use: off \| preset \| names \| full/);
+  assert.equal(retired.row(), before, "a typed retired shape changes nothing either");
 });
 
 test("preset ultra turns headroom on, and the presets below it turn it back off", async () => {
@@ -1476,11 +1532,11 @@ test("preset ultra turns headroom on, and the presets below it turn it back off"
     config: { openai_api_url: DEEPSEEK.baseUrl },
   });
   assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787, "ultra routed the session");
-  assert.match(rt.row(), /🔀 headroom: ON/);
+  assert.match(rt.row(), /🔀ON/);
 
   await rt.run("ts", "preset max");
   assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl, "max unroutes it again");
-  assert.match(rt.row(), /🔀 headroom: OFF/);
+  assert.match(rt.row(), /🔀OFF/);
 });
 
 // Writing a preset for new sessions drops the behaviour overrides that would fight it — but the row's
@@ -1525,14 +1581,14 @@ test("/ts config reaches the same writes as the typed verbs", async () => {
     [{ mode: "off" }],
     "a session-scoped pick writes what `/ts set ponytail=off` writes"
   );
-  assert.match(rt.row(), /ponytail: OFF/);
+  assert.match(rt.row(), /🐴O /, "the ponytail token is off, one letter in the default shape");
 
   // The same menu, the other scope: the pick lands in the config file and not in the session.
   const stored = ["Knob", "read", "off", "New sessions"];
   rt.ctx.ui.select = () => stored.shift();
   await rt.run("ts", "config");
   assert.equal(JSON.parse(readFileSync(CONFIG_FILE, "utf8")).modes.read, "off", "stored for new sessions");
-  assert.match(rt.row(), /read: FULL/, "storing a default leaves the running session alone");
+  assert.match(rt.row(), /📖F/, "storing a default leaves the running session alone");
   assert.deepEqual(stored, [], "the menu consumed exactly the selectors it showed");
 });
 

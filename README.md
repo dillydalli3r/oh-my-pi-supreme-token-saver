@@ -104,7 +104,7 @@ Every preset sets every *behaviour* knob, so a state either matches a preset or 
 Accepted values per knob: `caveman` `off|lite|full|ultra|wenyan` · `rtk` `off|on` · `ponytail`
 `off|lite|full|ultra` · `read` `off|lite|full` · `compress` `off|lite|full|ultra` · `prune`
 `off|lite|full|ultra` · `threshold` `off|lite|full|ultra` · `autoRtk` `off|on` · `headroom` `off|on` ·
-`status` `off|preset|compact|names|full`.
+`status` `off|preset|names|full`.
 
 Two knobs are deliberately outside the table above:
 
@@ -254,7 +254,9 @@ Levels: `off` · `lite` · `full` · `ultra`.
 | `compaction.idleThresholdTokens` | 200000 | 200000 | 120000 | 80000 | Token count that arms idle compaction |
 
 Those three keys are the compaction *trigger*: `prune` says what a compaction may drop, this says how full the
-context has to get before one runs.
+context has to get before one runs. The level word alone hides the number it picked, so the footer shows the
+number in the level's place — `⏱️70%` for `full`, `⏱️res` for `off`, whose limit is the host's reserve rather
+than a share of its own — and the spelled row carries both (`threshold full (70%)`).
 
 `compaction.thresholdPercent` is the only one of the three that is a *share* of the context window, which is why
 the knob dials it and not an absolute cap: the same percent means different token counts on a 200k and a 1M
@@ -479,19 +481,30 @@ Environment overrides:
 ## Status row
 
 `extensions/shared/status-line.js` is the **only** module that writes the `modes` status key, so a knob's
-symbol never depends on how the value was set (`/ts`, a per-app command, or the stored default). One row;
-the `status` knob picks its shape:
+symbol never depends on how the value was set (`/ts`, a per-app command, or the stored default). One row,
+built to fit a footer rather than to document the pack:
 
 | `status` | Row | Why |
 |---|---|---|
-| `full` (default) | `🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🔁 auto: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: FULL · ⏱️ threshold: FULL · 🔀 headroom: OFF` | Every tool named beside its icon and value |
-| `names` | `🧩 MAX · caveman: ULTRA · rtk: ON · auto: ON · ponytail: ULTRA · read: FULL · compress: FULL · prune: FULL · threshold: FULL · headroom: OFF` | The same row with no icon to decode |
-| `compact` | `🧩 MAX · 🦴U · 🦀ON · 🔁ON · 🐴U · 📖F · 🗜️F · 🧹F · ⏱️F · 🔀OFF` | Icons and one letter per value (the `max` preset here: `read`/`compress`/`prune`/`threshold` are all `full`; on/off knobs keep the word, since `ON` and `OFF` share a letter) |
+| `full` (default) | `🧩 MAX · 🦴U 🦀ON 🔁ON 🐴U · 📖F 🗜️F 🧹F ⏱️70% · 🔀OFF` | One icon and one value per knob, no label repeating what the icon says, grouped by the layer the knob configures: the prompt add-ons, the four OMP settings, the extras |
+| `names` | `🧩 MAX · caveman ultra · rtk on · autoRtk on · ponytail ultra · read full · compress full · prune full · threshold full (70%) · headroom off` | The same nine knobs spelled out — the knob's real name and its level in the lowercase the commands take — for when a letter would not be clear |
 | `preset` | `🧩 MAX` | One word: the preset determines all nine knobs anyway |
 | `off` | *(no row)* | The key is deleted, not blanked |
 
+How a knob is written in the default row:
+
+- An `on`/`off` knob keeps the word (`🦀ON`, `🔁OFF`): both spellings start with "O", so one letter would not
+  say which one is set.
+- A level knob shortens to its first letter (`🦴U` = `caveman=ultra`, `🗜️F` = `compress=full`) — off/lite/full/ultra,
+  plus `wenyan` for caveman.
+- `threshold` shows the number instead of the letter (`⏱️70%`), because the letter is only a stand-in for that
+  number and the row has room for one of them; `off` renders `⏱️res`, the host's reserve-based default.
+- A knob whose icon is missing renders as `name value` rather than vanishing.
+
 - The row opens with the preset, so it is also the readout of which preset the session is on — and no preset
   changes the shape, so switching presets never moves the row's layout.
+- `compact` was a shape until the default `full` row became the narrow one; the two would now be the same row
+  twice, so it is gone. A stored or branched `compact` resolves to the default instead of erroring.
 - `/ts config` → **Footer row** lists these with the exact row each one would render, so the shape is
   picked by what it looks like rather than spelled from memory (`Knob` → `status` sets the same knob).
 - `status` is display-only, and that is load-bearing in two places: it is excluded from the
