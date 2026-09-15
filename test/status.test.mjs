@@ -555,3 +555,112 @@ test("/combo keeps the pre-2.0 default verb and refuses the newer knobs", async 
   assert.match(refused.text, /Unknown preset: set/);
   assert.equal(rt.row(), running, "a refused verb changes nothing");
 });
+
+// Headroom is detect-and-guide: the pack never bundles it (a Python package with a CPython-extension
+// core), never wraps automatically (the wrap launches its own omp), and only redirects the anthropic
+// provider, so these tests pin the report, the in-session-safe half and the two refusals.
+const headroomCall = (call) => [call.command, ...call.args].join(" ");
+
+test("/ts headroom reports the installed version and this session's provider", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  rt.setExec(async () => ({ code: 0, stdout: "headroom, version 0.37.0\n", stderr: "" }));
+
+  rt.clearExecCalls();
+  await rt.run("ts", "headroom");
+  const report = rt.notifications.at(-1);
+  assert.equal(report.type, "info");
+  assert.match(report.text, /Headroom: headroom, version 0\.37\.0/);
+  assert.match(report.text, /wrap omp/, "the external command is printed");
+  assert.equal(rt.execCalls.length, 1, "one version probe");
+  assert.match(headroomCall(rt.execCalls[0]), /headroom --version$/);
+
+  // The alias surface reaches the same verb, and the provider line never claims a saving.
+  await rt.run("token-saver", "headroom status");
+  assert.match(rt.notifications.at(-1).text, /Headroom: headroom, version 0\.37\.0/);
+  assert.match(rt.notifications.at(-1).text, /Session provider: unknown/);
+
+  const openai = await createRuntime();
+  await openai.start();
+  openai.setExec(async () => ({ code: 0, stdout: "headroom, version 0.37.0", stderr: "" }));
+  openai.ctx.models = { current: () => ({ provider: "openai" }) };
+
+  await openai.run("ts", "headroom status");
+  const other = openai.notifications.at(-1);
+  assert.match(other.text, /Session provider: openai/);
+  assert.match(other.text, /a wrap changes nothing for this session/);
+});
+
+test("/ts headroom says not installed and prints the install line when the binary is absent", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  rt.setExec(async () => {
+    throw new Error("spawn headroom ENOENT");
+  });
+
+  await rt.run("ts", "headroom status");
+  const report = rt.notifications.at(-1);
+  assert.match(report.text, /Headroom: not installed/);
+  assert.match(report.text, /uv tool install --python 3\.13 "headroom-ai\[all\]"/);
+
+  // A non-zero exit is the same story: never a throw out of the command handler.
+  rt.setExec(async () => ({ code: 1, stdout: "", stderr: "not a command" }));
+  await rt.run("ts", "headroom");
+  assert.match(rt.notifications.at(-1).text, /Headroom: not installed/);
+});
+
+test("/ts headroom wrap refuses and spawns nothing", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  rt.setExec(async () => {
+    throw new Error("wrap must not be spawned");
+  });
+  rt.clearExecCalls();
+
+  await rt.run("ts", "headroom wrap omp");
+  const refusal = rt.notifications.at(-1);
+  assert.equal(refusal.type, "warning");
+  assert.match(refusal.text, /nest omp inside omp/);
+  assert.match(refusal.text, /Run it from your own shell/);
+  assert.deepEqual(rt.execCalls, [], "no subprocess at all");
+});
+
+test("/ts headroom unwrap runs `headroom unwrap omp` exactly once", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  rt.setExec(async () => ({ code: 0, stdout: "restored models.yml\n", stderr: "" }));
+  rt.clearExecCalls();
+
+  await rt.run("ts", "headroom unwrap");
+  assert.equal(rt.execCalls.length, 1);
+  assert.deepEqual(rt.execCalls[0].args.slice(-2), ["unwrap", "omp"]);
+  const done = rt.notifications.at(-1);
+  assert.equal(done.type, "info");
+  assert.match(done.text, /restored models\.yml/);
+  assert.match(done.text, /models\.yml:/, "the file it rewrote is named");
+
+  rt.setExec(async () => {
+    throw new Error("spawn headroom ENOENT");
+  });
+  await rt.run("ts", "headroom unwrap");
+  const failed = rt.notifications.at(-1);
+  assert.equal(failed.type, "warning");
+  assert.match(failed.text, /spawn headroom ENOENT/);
+});
+
+test("/combo refuses the headroom verb like the other non-preset verbs", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  const running = rt.row();
+  rt.setExec(async () => {
+    throw new Error("a refused verb must not spawn anything");
+  });
+  rt.clearExecCalls();
+
+  await rt.run("combo", "headroom");
+  const refused = rt.notifications.at(-1);
+  assert.equal(refused.type, "warning");
+  assert.match(refused.text, /Unknown preset: headroom/);
+  assert.equal(rt.row(), running, "a refused verb changes nothing");
+  assert.deepEqual(rt.execCalls, []);
+});

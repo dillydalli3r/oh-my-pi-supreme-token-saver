@@ -930,6 +930,25 @@ async function runDoctor() {
     console.log(`  rtk self-report: unavailable (${e.message.split("\n")[0]})`);
   }
 
+  // Headroom is an OPTIONAL external tool: this pack never bundles, installs, or depends on it, so a
+  // missing CLI is reported and the doctor still exits 0. The path comes from the platform's own PATH
+  // resolver (where / command -v) run through execCli — the same shell lookup the installer already
+  // relies on for `omp` — rather than a second resolver in JS.
+  try {
+    const version = (await execCli("headroom", ["--version"], { timeout: 5000 })).stdout.trim();
+    const exe = await execCli(IS_WINDOWS ? "where" : "sh", IS_WINDOWS ? ["headroom"] : ["-c", "command -v headroom"], { timeout: 5000 })
+      .then((r) => r.stdout.split(/\r?\n/)[0].trim())
+      .catch(() => "");
+    console.log(`  Headroom: ok ${version}${exe ? ` ${exe}` : ""}`);
+  } catch {
+    console.log("  Headroom: not installed (optional)");
+  }
+
+  const modelsYml = path.join(agentDir, "models.yml");
+  const modelsYmlText = await readIfExists(modelsYml);
+  console.log(`  Headroom wrap: ${modelsYmlText !== null && /headroom/i.test(modelsYmlText) ? "wrapped (models.yml anthropic baseUrl)" : "not wrapped"}`);
+  console.log("    `headroom wrap omp` only redirects the anthropic provider — other providers keep their endpoints.");
+
   // Caveman
   const cavemanIndex = path.join(extDir, "caveman-session", "index.js");
   const cavemanRule = path.join(extDir, "caveman-session", "rule.md");

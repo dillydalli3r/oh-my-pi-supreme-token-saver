@@ -113,6 +113,7 @@ other verbs.
 | `/ts default reset` | Delete the config file; back to built-in `max` |
 | `/ts option <group>.<key>=<value>` | Set a behaviour option (`compress.*`, `prune.*`, `read.*`, `autoRtk.*`, `status.*`, `native.mode`) |
 | `/ts native [status\|on\|off\|apply\|reset]` | Inspect/apply OMP's own settings; `on` is an alias for `auto` |
+| `/ts headroom [status\|unwrap\|wrap\|install]` | Optional external Headroom proxy: report status, `unwrap` in-session; `wrap`/`install` refuse and name the command to run yourself (see [Optional: Headroom](#optional-headroom)) |
 | `/ts help` | Usage, knob list, option list |
 
 Applying a preset or `set` persists session entries and reloads the session.
@@ -173,6 +174,71 @@ Notes that matter:
   `snapcompact`, and every display/statusLine/tui key — display keys cost no model tokens.
 - `/ts native reset` runs one `omp` process per key (19). A missing `omp` CLI degrades to a warning
   (`Native settings unavailable: … config.yml untouched.`); the preset itself still applies.
+
+## Optional: Headroom
+
+[Headroom](https://github.com/headroomlabs-ai/headroom) (Apache-2.0) is a context-compression layer that runs
+between an agent and its model provider and rewrites tool output, logs and history before they are sent. It is a
+**Python** package (`headroom-ai`) whose compression core is a CPython extension: the npm `headroom-ai` package is
+a TypeScript SDK with no `bin`, and there is no standalone binary to download. Version 0.37.0 at the time of
+writing — **198 PyPI releases since January 2026 and still no 1.0**. Read that plainly: it is a fast-moving
+pre-1.0 tool, so pin it and read its changelog before you depend on any of it.
+
+**This pack does not bundle Headroom, does not depend on it, and never installs it.** It only detects it: `doctor`
+reports it, and `/ts headroom` reports and unwraps it. Nothing here starts Headroom or routes your traffic for you.
+
+### What it measured for us — and what it did not
+
+Probed here through Headroom's own shipped `compress()` API:
+
+| Input | Measured reduction |
+|---|---|
+| JSON / structured log output | ~37-45% |
+| Shell output | ~0% |
+| Prose | ~0% |
+
+**These are our own probe measurements, not vendor benchmarks, and nothing here has been independently
+reproduced.** They say something narrower than the word "compression": Headroom's win is repetitive structured
+payloads. Shell transcripts and prose — most of what an OMP session actually carries — came back essentially
+unchanged.
+
+### The limitation that decides it
+
+`headroom wrap omp` works by injecting a marker-fenced `providers.anthropic.baseUrl` override into
+`~/.omp/agent/models.yml` (backed up byte-for-byte pre-wrap; `headroom unwrap omp` restores it). **It only
+redirects the `anthropic` provider.** A session running on any other provider — OpenAI-direct, Gemini, DeepSeek,
+whatever else — keeps its normal endpoint and the wrap changes nothing at all. It redirects the provider, not the
+tool output, so it applies to a whole session or to none of it.
+
+This pack's native-settings layer already covers structural read summaries (`read.summarize.*`), shell-output
+minimisation (`shellMinimizer.*`) and pruning of stale results (`compaction.supersedeReads`,
+`compaction.dropUseless`) without an external process, a proxy, or a second config file. For most sessions that is
+the better trade. Reach for Headroom when you are on Anthropic and feeding the model large repetitive JSON or log
+dumps.
+
+### Install (outside this pack)
+
+```bash
+uv tool install --python 3.13 "headroom-ai[all]"   # canonical — self-contained app env
+pip install "headroom-ai[all]"                     # or into the current Python
+npm install headroom-ai                            # TypeScript SDK only — no `headroom` command
+```
+
+Docker: `docker pull ghcr.io/headroomlabs-ai/headroom:latest` (headroom's own upstream image). Windows: the
+prebuilt wheel installs without a toolchain — a source build needs MSVC **and** a Rust toolchain, because the
+compression core is a CPython extension rather than a standalone binary.
+
+### Use, and how to get back out
+
+Run `headroom wrap omp` **from your own shell, never from inside a session**: it starts the proxy *and* launches a
+new `omp`, so running it inside a live session nests OMP inside OMP. After that:
+
+| Command | Effect |
+|---|---|
+| `/ts headroom` (or `/ts headroom status`) | Headroom version, wrap state, and whether a wrap would even cover this session's provider |
+| `/ts headroom unwrap` | Restore the pre-wrap `models.yml` (runs `headroom unwrap omp`; safe from inside a session) |
+| `/ts headroom wrap` | Refuses, prints the command to run yourself — starting it here would nest OMP |
+| `/ts headroom install` | Refuses, prints the uv/pip/Docker lines above — this pack installs nothing for you |
 
 ## Configuration file
 
@@ -251,6 +317,7 @@ Compact form (`preset ultra`, or `status compact`):
 | Session defaults | `~/.omp/agent/token-saver.json` |
 | Legacy pre-2.0 defaults (read once, deleted on first write) | `~/.omp/agent/combo-defaults.json` |
 | OMP native settings and extension registrations | `~/.omp/agent/config.yml` |
+| OMP model config (what an external `headroom wrap omp` edits) | `~/.omp/agent/models.yml` |
 | Project scope install target | `./.omp/extensions` |
 
 Pre-2.0 shipped a separate `combo-toggle` extension directory. 2.0 has no such directory: `/combo` is
@@ -291,6 +358,12 @@ The native layer is optional. With no `omp` CLI on the path, `/ts native …` an
 report `Native settings unavailable: … config.yml untouched.` as a warning — the preset still applies and
 no OMP file is modified. Everything else in the pack is unaffected.
 
+### Headroom wrap left behind after an experiment
+
+If `models.yml` is still wrapped after a Headroom experiment, `/ts headroom unwrap` — or `headroom unwrap omp`
+from your own shell — restores the pre-wrap file byte-for-byte; `doctor` reports the state either way
+(`Headroom wrap: wrapped (models.yml anthropic baseUrl)` / `not wrapped`).
+
 ### WSL
 
 Windows and WSL have separate OMP homes. Run the install from inside WSL and check `command -v npm`: it
@@ -306,7 +379,7 @@ Entry point: `oh-my-pi-supreme-token-saver` (`install-omp-addons.js`).
 | `install` | Install the add-ons; user scope by default |
 | `update` | Run the latest installer — npm package first, GitHub source as fallback |
 | `reinstall` | Clean and reinstall the user-scope add-ons |
-| `doctor` | Check OMP, extension, Ponytail, and RTK health (including the stale `combo-toggle` check) |
+| `doctor` | Check OMP, extension, Ponytail, RTK, and Headroom health (including the stale `combo-toggle` check; a missing Headroom is reported as optional, never fatal) |
 | `uninstall` | Remove the managed extensions |
 | `version` | Print the package version |
 | `help` | Print usage |

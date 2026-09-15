@@ -8,6 +8,7 @@
 // instead of running code: this extension is the single place a preset is chosen, and `omp config`
 // is the only writer of the host's settings (it validates each key against the host's schema).
 
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -109,6 +110,85 @@ function ompCommand(args) {
   return IS_WINDOWS ? ["cmd.exe", ["/c", "omp", ...args]] : ["omp", args];
 }
 
+// Headroom is detect-and-guide only: it is an optional external Python tool whose Rust core is a
+// CPython extension (no JS surface for us to import, nothing to bundle), and `headroom wrap omp`
+// only redirects the anthropic provider — so we report what the machine has and hand over the
+// commands, and we never wrap, install, or call it on a session event.
+const HEADROOM_TIMEOUT_MS = 10000;
+const HEADROOM_INSTALL = 'uv tool install --python 3.13 "headroom-ai[all]"';
+
+// Same Windows shim as ompCommand: a bare `headroom` does not resolve to the .exe without a shell.
+function headroomCommand(args) {
+  return IS_WINDOWS
+    ? [process.env.ComSpec || "cmd.exe", ["/c", "headroom", ...args]]
+    : ["headroom", args];
+}
+
+async function execHeadroom(pi, args) {
+  if (typeof pi?.exec !== "function") throw new Error("this session exposes no exec");
+  const [command, argv] = headroomCommand(args);
+  const result = await pi.exec(command, argv, { timeout: HEADROOM_TIMEOUT_MS });
+  if (result?.code !== 0) {
+    const stderr = String(result?.stderr || result?.stdout || "").trim().split("\n").filter(Boolean).pop();
+    throw new Error(stderr || `headroom exited ${result?.code}`);
+  }
+  return clip(result?.stdout || result?.stderr, 600);
+}
+
+// A status report is a notification, not a file dump.
+function clip(text, max) {
+  const flat = String(text || "").replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+// `headroom wrap omp` fenced-injects a providers.anthropic.baseUrl override into the agent dir's
+// models.yml, so that mention is the whole wrap state visible from here.
+function headroomWrapState() {
+  const file = path.join(AGENT_DIR, "models.yml");
+  let text;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return { file, state: "models.yml missing", line: "" };
+  }
+  const line = text.split(/\r?\n/).find((row) => /headroom/i.test(row));
+  return { file, state: line ? "wrapped" : "not wrapped", line: clip(line, 120) };
+}
+
+// The wrap only rewrites the anthropic baseUrl, so any other active provider keeps its own endpoint.
+function activeProvider(ctx) {
+  try {
+    return clip(ctx?.models?.current?.()?.provider, 120);
+  } catch {
+    return "";
+  }
+}
+
+async function headroomStatusText(pi, ctx) {
+  let version = "";
+  try {
+    version = await execHeadroom(pi, ["--version"]);
+  } catch {
+    version = "";
+  }
+
+  const wrap = headroomWrapState();
+  const provider = activeProvider(ctx);
+  return [
+    version ? `Headroom: ${version}` : `Headroom: not installed\nInstall: ${HEADROOM_INSTALL}`,
+    `Wrap: ${wrap.state}${wrap.line ? ` — ${wrap.line}` : ""}`,
+    `Session provider: ${provider || "unknown"} — \`headroom wrap omp\` redirects only the anthropic provider, so ${
+      provider === "anthropic"
+        ? "a wrap would cover this session's traffic"
+        : "a wrap changes nothing for this session"
+    }`,
+    `models.yml: ${wrap.file}`,
+    "Run from your own shell — it starts a proxy and launches a new omp, so not from inside omp:",
+    "  headroom wrap omp",
+    "Undo (safe here or there): /ts headroom unwrap",
+  ].join("\n");
+}
+
 async function execOmp(pi, args) {
   if (typeof pi?.exec !== "function") throw new Error("this session exposes no exec");
   const [command, argv] = ompCommand([...args, "--json"]);
@@ -168,6 +248,7 @@ function usageText() {
     "/ts default [<preset> | <knob>=<value> ... | reset]  — what new sessions start from",
     "/ts option <group>.<key>=<value>  — behaviour of our own add-ons",
     "/ts native [status|on|off|apply|reset]  — OMP's own read/shell/compaction settings",
+    "/ts headroom [status|wrap|unwrap|install]  — optional Headroom proxy: detect it, unwrap in-session, run wrap yourself",
     "/ts help                     — this list",
     "",
     `Knobs: ${MODE_KNOBS.map((name) => `${name} (${KNOBS[name].join("|")})`).join(", ")}`,
@@ -594,6 +675,58 @@ export default function tokenSaverExtension(pi) {
     notify(ctx, "Usage: /ts native [on|off|apply|reset|status]", "warning");
   }
 
+  // Headroom is never wrapped automatically: the wrap command launches its own omp, so only the
+  // safe half (status, unwrap) and the pure-information half (install) run here.
+  async function headroomVerb(arg, ctx) {
+    const verb = String(arg || "").trim().split(/\s+/)[0].toLowerCase();
+
+    if (!verb || verb === "status") {
+      notify(ctx, await headroomStatusText(pi, ctx), "info");
+      return;
+    }
+
+    if (verb === "wrap") {
+      notify(
+        ctx,
+        "Refusing: `headroom wrap omp` starts a proxy and launches its own omp, so running it here would nest omp inside omp.\n" +
+          "Run it from your own shell instead: headroom wrap omp",
+        "warning"
+      );
+      return;
+    }
+
+    if (verb === "unwrap") {
+      const wrap = headroomWrapState();
+      try {
+        const printed = await execHeadroom(pi, ["unwrap", "omp"]);
+        notify(ctx, `headroom unwrap omp: ${printed || "done (no output)"}\nmodels.yml: ${wrap.file}`, "info");
+      } catch (error) {
+        notify(
+          ctx,
+          `headroom unwrap omp failed: ${clip(error?.message || error, 600)}\nmodels.yml: ${wrap.file}\nRun /ts headroom status.`,
+          "warning"
+        );
+      }
+      return;
+    }
+
+    if (verb === "install") {
+      notify(
+        ctx,
+        "Refusing to run an installer here: Headroom is a Python package (its Rust core is a CPython " +
+          "extension) and installing it needs a Python toolchain and an interactive shell.\n" +
+          `uv: ${HEADROOM_INSTALL} (canonical)\n` +
+          'pip: pip install "headroom-ai[all]"\n' +
+          "Docker: docker pull ghcr.io/headroomlabs-ai/headroom:latest\n" +
+          "Windows: the prebuilt wheel works as-is; a source build needs MSVC + Rust.",
+        "info"
+      );
+      return;
+    }
+
+    notify(ctx, "Usage: /ts headroom [status|wrap|unwrap|install]", "warning");
+  }
+
   async function dispatch(arg, ctx, presetOnly) {
     const text = String(arg || "").trim();
     const head = text.split(/\s+/)[0].toLowerCase();
@@ -645,6 +778,10 @@ export default function tokenSaverExtension(pi) {
     }
     if (head === "native") {
       await applyNativeVerb(rest, ctx);
+      return;
+    }
+    if (head === "headroom") {
+      await headroomVerb(rest, ctx);
       return;
     }
     notify(ctx, `Unknown command: ${head}. ${usageText()}`, "warning");
