@@ -166,6 +166,19 @@ function execP(cmd, args, opts = {}) {
   });
 }
 
+// Windows resolves `omp`/`npm` to .exe/.cmd/.bat shims through PATHEXT, which execFile does not do,
+// and Node rejects .cmd/.bat outright without a shell. Build the command line instead of passing an
+// args array so a shell run does not hit Node's DEP0190 warning.
+function quoteArg(arg) {
+  const value = String(arg);
+  return /[\s"&|<>^()%]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
+}
+
+function execCli(command, args, opts = {}) {
+  if (!IS_WINDOWS) return execP(command, args, opts);
+  return execP([command, ...args].map(quoteArg).join(" "), [], { ...opts, shell: true });
+}
+
 async function writeIfChanged(dest, content, options = {}) {
   const existing = await readIfExists(dest);
   if (existing === content) {
@@ -349,8 +362,7 @@ async function stepPonytail(pluginsDir, userDir, options = {}) {
 
   // Try omp plugin install first
   try {
-    await execP(IS_WINDOWS ? "omp.cmd" : "omp", ["plugin", "install", "github:DietrichGebert/ponytail"],
-      { cwd: pluginsDir });
+    await execCli("omp", ["plugin", "install", "github:DietrichGebert/ponytail"], { cwd: pluginsDir });
     console.log("  [ok] omp plugin install ran");
   } catch (e) {
     console.log(`  [warn] omp plugin install failed: ${e.message}`);
@@ -358,7 +370,7 @@ async function stepPonytail(pluginsDir, userDir, options = {}) {
 
   if (options.reinstall) {
     try {
-      await execP("npm", [
+      await execCli("npm", [
         "install",
         "@dietrichgebert/ponytail@latest",
         "--save",
@@ -380,7 +392,7 @@ async function stepPonytail(pluginsDir, userDir, options = {}) {
   if (!ponytailExtExists) {
     console.log("  [info] pi-extension/index.js not found after omp plugin install — trying npm/bun install...");
     try {
-      await execP("npm", ["install"], { cwd: pluginsDir, timeout: 120000 });
+      await execCli("npm", ["install"], { cwd: pluginsDir, timeout: 120000 });
       console.log("  [ok] npm install completed");
     } catch {
       try {
@@ -673,7 +685,7 @@ async function runDoctor() {
 
   // OMP CLI
   try {
-    const v = (await execP(IS_WINDOWS ? "omp.cmd" : "omp", ["--version"])).stdout.trim();
+    const v = (await execCli("omp", ["--version"])).stdout.trim();
     console.log(`  OMP CLI: ok ${v}`);
   } catch {
     console.log("  OMP CLI: MISSING");
@@ -1002,7 +1014,7 @@ async function main() {
   // Check prerequisites
   console.log("\nPrerequisites:");
   try {
-    const v = (await execP(IS_WINDOWS ? "omp.cmd" : "omp", ["--version"])).stdout.trim();
+    const v = (await execCli("omp", ["--version"])).stdout.trim();
     console.log(`  [ok] omp ${v}`);
   } catch {
     console.log("  [fail] omp not found — ensure it's installed");
