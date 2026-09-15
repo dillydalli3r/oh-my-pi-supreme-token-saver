@@ -97,6 +97,12 @@ Options:
   --version, -v
   --help, -h
 
+Legacy aliases:
+  --doctor, --uninstall        Same as the doctor / uninstall commands
+
+Internal (set by \`update\`, not a user flag):
+  --apply-update               Marks the re-exec of the latest installer
+
 The extension ships one command surface: /token-saver (alias /ts), with /combo kept
 as a preset-only alias. The presets (off, lite, medium, high, max, ultra) drive all
 eight knobs — caveman, rtk, ponytail, read, compress, prune, autoRtk, status.`);
@@ -138,10 +144,6 @@ const PRESET_NAMES = ["off", "lite", "medium", "high", "max", "ultra"];
 const DEFAULT_PRESET = "max";
 
 // --- Helpers ---
-
-function sha256Hex(text) {
-  return createHash("sha256").update(text, "utf8").digest("hex");
-}
 
 async function sha256File(filePath) {
   const buf = await fs.readFile(filePath);
@@ -387,8 +389,17 @@ async function ensurePonytailConfig(options = {}) {
 
 // --- Steps ---
 
+// Labels are numbered at runtime because the same step function runs again for `--scope both`, so
+// hardcoded "[n/7]" text goes stale the moment the install sequence changes. stepTotal is set in
+// main() from the blocks that will actually run.
+let stepIndex = 0;
+let stepTotal = 0;
+function stepHeader(label) {
+  console.log(`\n[${++stepIndex}/${stepTotal}] ${label}`);
+}
+
 async function stepPonytail(pluginsDir, userDir, options = {}) {
-  console.log("\n[1/7] Installing Ponytail plugin...");
+  stepHeader("Installing Ponytail plugin...");
   // Nothing on disk during a dry run — an empty ~/.omp/plugins would still be a change.
   if (!options.dryRun) await fs.mkdir(pluginsDir, { recursive: true });
   const pkgPath = path.join(pluginsDir, "package.json");
@@ -413,7 +424,7 @@ async function stepPonytail(pluginsDir, userDir, options = {}) {
     console.log(`  [dry-run] would write ${pkgPath}`);
   } else {
     await fs.writeFile(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
-    console.log(`  [write] package.json`);
+    console.log(`  [write] ${pkgPath}`);
   }
 
   if (options.dryRun) {
@@ -515,7 +526,7 @@ async function stepPonytail(pluginsDir, userDir, options = {}) {
 }
 
 async function stepRtk(binDir, options = {}) {
-  console.log("\n[2/7] Installing RTK binary...");
+  stepHeader("Installing RTK binary...");
 
   // Map (platform, arch) → Rust triple stem.
   const PLATFORM = process.platform;
@@ -675,6 +686,7 @@ async function stepRtk(binDir, options = {}) {
 }
 
 async function stepSharedSessionState(extDir, options = {}) {
+  stepHeader("Installing shared session state and status line...");
   const src = await readIfExists(SHARED_SESSION_STATE);
   if (!src) {
     console.log("  [skip] shared/session-state.js not found in repo");
@@ -691,7 +703,7 @@ async function stepSharedSessionState(extDir, options = {}) {
 }
 
 async function stepModeReinforcement(extDir, ponytailExtPath, options = {}) {
-  console.log("\n[6/7] Installing mode reinforcement extension...");
+  stepHeader("Installing mode reinforcement extension...");
   const src = await readIfExists(MODE_REINFORCEMENT_INDEX);
   if (!src) {
     console.log("  [skip] shared/mode-reinforcement.js not found in repo");
@@ -703,7 +715,7 @@ async function stepModeReinforcement(extDir, ponytailExtPath, options = {}) {
 }
 
 async function stepRtkSession(extDir, options = {}) {
-  console.log("\n[3/7] Installing RTK session extension...");
+  stepHeader("Installing RTK session extension...");
   const src = await readIfExists(RTK_SESSION_INDEX);
   if (!src) {
     console.log("  [skip] rtk-session/index.js not found in repo");
@@ -714,7 +726,7 @@ async function stepRtkSession(extDir, options = {}) {
 }
 
 async function stepCaveman(extDir, options = {}) {
-  console.log("\n[4/7] Installing Caveman session extension...");
+  stepHeader("Installing Caveman session extension...");
   const cavemanDir = path.join(extDir, "caveman-session");
   if (!options.dryRun) await fs.mkdir(cavemanDir, { recursive: true });
 
@@ -749,10 +761,11 @@ async function stepCaveman(extDir, options = {}) {
   }
 }
 
-// 2.0 install steps, in order: 1 Ponytail, 2 RTK binary, 3 RTK session, 4 Caveman, 5 Token Saver
-// (session knobs + the /token-saver command surface), 6 mode reinforcement, 7 Amanai reward.
+// 2.0 install steps, in the order main() runs them for user scope: 1 shared session state,
+// 2 Ponytail, 3 RTK binary, 4 RTK session, 5 Caveman, 6 Token Saver (session knobs + the
+// /token-saver command surface), 7 mode reinforcement, 8 Amanai reward, 9 defaults file.
 async function stepTokenSaver(extDir, options = {}) {
-  console.log("\n[5/7] Installing Token Saver extension...");
+  stepHeader("Installing Token Saver extension...");
   const configPath = path.join(path.dirname(extDir), "config.yml");
 
   // Pre-2.0 installs left the old combo directory behind, which registers a second /combo command
@@ -805,6 +818,7 @@ function tokenSaverConfigPath() {
 // First run only: seed the default preset. An existing file is the user's choice and is left alone
 // unless --preset came with --force-preset, so an update never resets a session preset.
 async function stepTokenSaverConfig(options = {}) {
+  stepHeader("Seeding the Token Saver defaults file...");
   const configPath = tokenSaverConfigPath();
   const preset = options.preset || DEFAULT_PRESET;
   const exists = (await readIfExists(configPath)) !== null;
@@ -823,7 +837,7 @@ async function stepTokenSaverConfig(options = {}) {
 }
 
 async function stepAmanaiReward(extDir, options = {}) {
-  console.log("\n[7/7] Installing Amanai reward detector...");
+  stepHeader("Installing Amanai reward detector...");
   const src = await readIfExists(AMANAI_REWARD_INDEX);
   if (!src) {
     console.log("  [skip] amanai-reward/index.js not found in repo");
@@ -1262,7 +1276,9 @@ async function main() {
     console.log("  [fail] omp not found — ensure it's installed");
   }
 
-  // Install per scope
+  // Install per scope. User scope plays eight steps, project scope replays four of them, and the
+  // defaults step closes every run — stepTotal has to match the blocks that actually execute.
+  stepTotal = (scope === "1" || scope === "3" ? 8 : 0) + (scope === "2" || scope === "3" ? 4 : 0) + 1;
   if (scope === "1" || scope === "3") {
     console.log("\n--- User-level install ---");
     await stepSharedSessionState(userExtDir, options);
@@ -1286,7 +1302,6 @@ async function main() {
   }
 
   // After the extensions, so a first-run preset lands next to an installed command surface.
-  console.log("\n--- Token Saver defaults ---");
   await stepTokenSaverConfig(options);
 
   console.log("\n=== Installation complete ===");

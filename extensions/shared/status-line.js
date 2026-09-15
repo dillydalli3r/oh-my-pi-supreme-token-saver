@@ -9,7 +9,7 @@ import { getSharedUsage } from "./session-state.js";
 
 const STATUS_KEY = "modes";
 
-export const KNOB_MARKERS = Object.freeze({
+const KNOB_MARKERS = Object.freeze({
   caveman: "🦴",
   rtk: "🦀",
   ponytail: "🐴",
@@ -24,7 +24,7 @@ const METER_MARKER = "👁";
 const KNOB_ORDER = Object.freeze(Object.keys(KNOB_MARKERS));
 
 // `on`/`off` stay words; a mode name shortens to its first letter in the compact row.
-export function knobValue(_name, value) {
+function knobValue(_name, value) {
   return String(value || "off").toUpperCase();
 }
 
@@ -33,7 +33,7 @@ function compactValue(name, value) {
   return name === "rtk" || name === "autoRtk" ? text : text.slice(0, 1);
 }
 
-export function statusText(state, usage) {
+function statusText(state, usage) {
   if (!state || state.status === "off") return "";
   const compact = state.status === "compact";
   const parts = [`${PRESET_MARKER} ${String(state.preset || "custom").toUpperCase()}`];

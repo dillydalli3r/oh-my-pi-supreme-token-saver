@@ -1,12 +1,13 @@
 // Supreme Token Saver — the one entry point for the pack: presets, the unified status row, and the
-// driver that mirrors a preset onto OMP's own native settings.
+// driver that mirrors the running state onto OMP's own native settings.
 //
 // The three behaviours this pack used to reimplement in JS — structural read summaries, shell-output
 // compression, and cache-aware pruning of stale tool results — ship inside OMP itself and are
 // configured through `config.yml`. Duplicating them as hooks would drift from the host and cost a
-// round trip per call, so the `read` / `compress` / `prune` knobs now *select* native settings
-// instead of running code: this extension is the single place a preset is chosen, and `omp config`
-// is the only writer of the host's settings (it validates each key against the host's schema).
+// round trip per call, so the `read` / `compress` / `prune` knobs *select* native settings instead
+// of running code, and the preset supplies the tier dials those behaviours do not cover. `omp
+// config` is the only writer of the host's settings (it validates each key against the host's
+// schema).
 
 import { readFileSync } from "node:fs";
 import os from "node:os";
@@ -17,11 +18,13 @@ import {
   DEFAULT_PRESET,
   KNOBS,
   MODE_KNOBS,
+  OPTION_VALUES,
   PRESET_NAMES,
   clearConfig,
   canonicalKnob,
   getSharedState,
   normalizeMode,
+  normalizeOptionValue,
   normalizePreset,
   presetModes,
   readConfig,
@@ -40,63 +43,182 @@ const IS_WINDOWS = process.platform === "win32";
 const OMP_TIMEOUT_MS = 15000;
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".omp", "agent");
 
-// Preset -> native OMP settings. Every key below exists in the host's settings schema
+// Knob level -> native OMP settings. Every key below exists in the host's settings schema
 // (pi-coding-agent src/config/settings-schema.ts), and `omp config set` rejects anything that is
-// not in it, which is what keeps this table honest as OMP moves.
+// not in it, which is what keeps these tables honest as OMP moves.
 //   read.summarize.*                       structural summaries for selector-less reads (the `read` knob)
-//   shellMinimizer.*                       compresses verbose shell output (the `compress` knob)
-//   compaction.supersedeReads/dropUseless  cache-aware elision of stale results (the `prune` knob)
-// plus the size dials those behaviours read: read.defaultLimit, the tools.artifact* spill keys,
-// compaction.keepRecentTokens/idleEnabled, task.* and the top-level skillful.
-const NATIVE_TABLE_ORDER = Object.freeze(["lite", "medium", "high", "max", "ultra"]);
+//   read.defaultLimit                      the size dial that behaviour reads
+//   shellMinimizer.* / tools.artifact*     compress verbose shell output (the `compress` knob)
+//   compaction.*                           cache-aware elision of stale results (the `prune` knob)
+// One table per knob, keyed by level, because the knobs are independent: a user who sets
+// compress=ultra and leaves `read` alone must get the ultra compress keys and the default read
+// keys, which a single preset-keyed column cannot express. Every key is spelled exactly as the
+// host's schema spells it — `tools.artifactSpillThreshold` and the `tools.artifactTail*` keys are
+// scalar dotted keys, not a `tools.artifact.*` group.
+const KNOB_NATIVE = Object.freeze({
+  read: Object.freeze({
+    off: Object.freeze({
+      "read.summarize.enabled": false,
+      "read.summarize.prose": false,
+      "read.summarize.minTotalLines": 100,
+      "read.summarize.unfoldLimit": 100,
+      "read.defaultLimit": 300,
+    }),
+    lite: Object.freeze({
+      "read.summarize.enabled": true,
+      "read.summarize.prose": false,
+      "read.summarize.minTotalLines": 100,
+      "read.summarize.unfoldLimit": 100,
+      "read.defaultLimit": 300,
+    }),
+    full: Object.freeze({
+      "read.summarize.enabled": true,
+      "read.summarize.prose": true,
+      "read.summarize.minTotalLines": 60,
+      "read.summarize.unfoldLimit": 60,
+      "read.defaultLimit": 200,
+    }),
+  }),
+  compress: Object.freeze({
+    off: Object.freeze({
+      "shellMinimizer.enabled": false,
+      "shellMinimizer.sourceOutlineLevel": "default",
+      "tools.artifactSpillThreshold": 50,
+      "tools.artifactTailBytes": 20,
+      "tools.artifactHeadBytes": 20,
+      "tools.artifactTailLines": 500,
+    }),
+    lite: Object.freeze({
+      "shellMinimizer.enabled": true,
+      "shellMinimizer.sourceOutlineLevel": "default",
+      "tools.artifactSpillThreshold": 50,
+      "tools.artifactTailBytes": 20,
+      "tools.artifactHeadBytes": 20,
+      "tools.artifactTailLines": 500,
+    }),
+    full: Object.freeze({
+      "shellMinimizer.enabled": true,
+      "shellMinimizer.sourceOutlineLevel": "default",
+      "tools.artifactSpillThreshold": 20,
+      "tools.artifactTailBytes": 12,
+      "tools.artifactHeadBytes": 12,
+      "tools.artifactTailLines": 300,
+    }),
+    ultra: Object.freeze({
+      "shellMinimizer.enabled": true,
+      "shellMinimizer.sourceOutlineLevel": "aggressive",
+      "tools.artifactSpillThreshold": 10,
+      "tools.artifactTailBytes": 8,
+      "tools.artifactHeadBytes": 0,
+      "tools.artifactTailLines": 200,
+    }),
+  }),
+  prune: Object.freeze({
+    off: Object.freeze({
+      "compaction.supersedeReads": false,
+      "compaction.dropUseless": false,
+      "compaction.keepRecentTokens": 20000,
+      "compaction.idleEnabled": false,
+    }),
+    lite: Object.freeze({
+      "compaction.supersedeReads": true,
+      "compaction.dropUseless": false,
+      "compaction.keepRecentTokens": 20000,
+      "compaction.idleEnabled": false,
+    }),
+    full: Object.freeze({
+      "compaction.supersedeReads": true,
+      "compaction.dropUseless": true,
+      "compaction.keepRecentTokens": 12000,
+      "compaction.idleEnabled": false,
+    }),
+    ultra: Object.freeze({
+      "compaction.supersedeReads": true,
+      "compaction.dropUseless": true,
+      "compaction.keepRecentTokens": 8000,
+      "compaction.idleEnabled": true,
+    }),
+  }),
+});
 
-// One column per preset, one row per setting, so the whole mapping is reviewable at a glance. Every
-// key is spelled exactly as the host's schema spells it — `tools.artifactSpillThreshold` and the
-// `tools.artifactTail*` keys are scalar dotted keys, not a `tools.artifact.*` group.
+// The tier dials — prompt-level behaviour that no single knob owns, so they stay keyed by preset.
 //   tools.intentTracing defaults to TRUE and adds an intent string to every tool call; it is the one
 //   key whose token-saving value is `false`, so only `high` and above switch it off.
 //   skillful=false removes the skill inventory from the system prompt — a real tradeoff, so `ultra`.
-//   tools.artifactHeadBytes=0 means tail-only spill.
+//   tools.artifactHeadBytes=0 (in `compress`) means tail-only spill.
 //   compaction.keepRecentTokens is the verbatim-history floor left after a compaction: the main dial
 //   on post-compaction context size.
 // Left deliberately alone: provider.appendOnlyContext (already cache-friendly), memory.backend,
 // advisor/autolearn/prewalk (off by default), snapcompact (experimental), and every
 // display/statusLine/tui key — display-only, zero model tokens.
-const NATIVE_TABLE = Object.freeze({
-  "read.summarize.enabled": Object.freeze([true, true, true, true, true]),
-  "read.summarize.prose": Object.freeze([false, false, false, true, true]),
-  "read.summarize.minTotalLines": Object.freeze([100, 100, 80, 60, 40]),
-  "read.summarize.unfoldLimit": Object.freeze([100, 100, 80, 60, 40]),
-  "read.defaultLimit": Object.freeze([300, 300, 200, 200, 200]),
-  "shellMinimizer.enabled": Object.freeze([true, true, true, true, true]),
-  "shellMinimizer.sourceOutlineLevel": Object.freeze(["default", "default", "default", "default", "aggressive"]),
-  "tools.artifactSpillThreshold": Object.freeze([50, 50, 30, 20, 10]),
-  "tools.artifactTailBytes": Object.freeze([20, 20, 16, 12, 8]),
-  "tools.artifactHeadBytes": Object.freeze([20, 20, 16, 12, 0]),
-  "tools.artifactTailLines": Object.freeze([500, 500, 400, 300, 200]),
-  "tools.intentTracing": Object.freeze([true, true, false, false, false]),
-  "compaction.supersedeReads": Object.freeze([true, true, true, true, true]),
-  "compaction.dropUseless": Object.freeze([true, true, true, true, true]),
-  "compaction.keepRecentTokens": Object.freeze([20000, 20000, 16000, 12000, 8000]),
-  "compaction.idleEnabled": Object.freeze([false, false, false, true, true]),
-  "task.maxEffort": Object.freeze(["max", "max", "high", "high", "medium"]),
-  "task.softRequestBudget": Object.freeze([200, 200, 200, 150, 90]),
-  skillful: Object.freeze([true, true, true, true, false]),
+const PRESET_NATIVE = Object.freeze({
+  lite: Object.freeze({
+    "tools.intentTracing": true,
+    "task.maxEffort": "max",
+    "task.softRequestBudget": 200,
+    skillful: true,
+  }),
+  medium: Object.freeze({
+    "tools.intentTracing": true,
+    "task.maxEffort": "max",
+    "task.softRequestBudget": 200,
+    skillful: true,
+  }),
+  high: Object.freeze({
+    "tools.intentTracing": false,
+    "task.maxEffort": "high",
+    "task.softRequestBudget": 200,
+    skillful: true,
+  }),
+  max: Object.freeze({
+    "tools.intentTracing": false,
+    "task.maxEffort": "high",
+    "task.softRequestBudget": 150,
+    skillful: true,
+  }),
+  ultra: Object.freeze({
+    "tools.intentTracing": false,
+    "task.maxEffort": "medium",
+    "task.softRequestBudget": 90,
+    skillful: false,
+  }),
 });
 
-const NATIVE_KEYS = Object.freeze(Object.keys(NATIVE_TABLE));
+// Every key any table can write, computed once at load: `off` resets exactly this set, and the
+// status table walks it so it can never drift from the mapping above.
+const NATIVE_KEYS = Object.freeze([
+  ...new Set([
+    ...Object.values(KNOB_NATIVE).flatMap((levels) => Object.values(levels).flatMap((level) => Object.keys(level))),
+    ...Object.values(PRESET_NATIVE).flatMap((tier) => Object.keys(tier)),
+  ]),
+]);
 
 // `off` writes no anti-defaults: it resets this exact key set to the host's defaults, because a
 // pinned `false` would outlive the release it was written for, while a reset returns to whatever the
 // host then considers sane.
 const NATIVE_OFF = "off";
 
-function nativeMapping(preset) {
-  const column = NATIVE_TABLE_ORDER.indexOf(preset);
-  if (column < 0) return null;
-  const mapping = {};
-  for (const key of NATIVE_KEYS) mapping[key] = NATIVE_TABLE[key][column];
-  return mapping;
+// The tier dials come from the state's preset. A hand-mixed knob set has no tier of its own, so the
+// dials fall back to the built-in default tier rather than inventing one from whichever knobs happen
+// to be set.
+function tierOf(state) {
+  return PRESET_NATIVE[state.preset] ? state.preset : DEFAULT_PRESET;
+}
+
+// What the running state wants written: the three knobs' keys plus the tier's dials.
+function nativeMapping(state) {
+  return {
+    ...KNOB_NATIVE.read[state.read],
+    ...KNOB_NATIVE.compress[state.compress],
+    ...KNOB_NATIVE.prune[state.prune],
+    ...PRESET_NATIVE[tierOf(state)],
+  };
+}
+
+// What a write or a status report is based on: a preset state names itself, a hand-mixed one says so
+// and names the tier whose dials it fell back to.
+function nativeTier(state) {
+  return PRESET_NAMES.includes(state.preset) ? state.preset : `${tierOf(state)} (state is custom)`;
 }
 
 function nativeText(value) {
@@ -236,10 +358,6 @@ function pairs(text, separator) {
   return String(text || "").trim().split(separator).filter(Boolean);
 }
 
-function presetOf(state) {
-  return NATIVE_TABLE_ORDER.includes(state.preset) || state.preset === NATIVE_OFF ? state.preset : null;
-}
-
 function usageText() {
   return [
     "/ts                          — status: preset, knobs, context meter, config path",
@@ -268,7 +386,9 @@ function statusText(ctx) {
     MODE_KNOBS.map((name) => `${name}=${state[name]}`).join(" "),
     `Context: ${percent}`,
     `Config: ${CONFIG_FILE}`,
-    `Native config.yml: ${readOptions().native.mode}${readOptions().native.mode === "auto" ? " (follows the preset)" : " (/ts native apply writes it)"}`,
+    `Native config.yml: ${readOptions().native.mode}${
+      readOptions().native.mode === "auto" ? " (follows the knobs and preset)" : " (/ts native apply writes it)"
+    }`,
     `Default for new sessions: ${String(defaults.preset).toUpperCase()} (${MODE_KNOBS.map((name) => `${name}=${defaults.modes[name]}`).join(" ")})`,
     "Run /ts help for the command list.",
   ].join("\n");
@@ -303,8 +423,18 @@ export default function tokenSaverExtension(pi) {
     return renderModes(getSharedState(), ctx);
   }
 
+  // A config path that cannot be written (a directory, a read-only install) must degrade to a
+  // warning like the native and headroom layers do, never throw out of the command handler.
+  function reportWrite(ctx, result) {
+    if (!result.error) return true;
+    notify(ctx, `Config not written: ${result.error}\nFile: ${CONFIG_FILE}`, "warning");
+    return false;
+  }
+
   function reconcile(ctx) {
-    const state = reconcileSharedEntries(entriesFrom(ctx));
+    // The session id keeps a second runner in this process (a subagent gets its own) from
+    // republishing its empty branch over this session's live state.
+    const state = reconcileSharedEntries(entriesFrom(ctx), ctx?.sessionManager?.getSessionId?.());
     render(ctx);
     return state;
   }
@@ -397,17 +527,15 @@ export default function tokenSaverExtension(pi) {
     );
   }
 
-  async function applyNative(preset, ctx, force) {
-    if (preset === NATIVE_OFF) {
-      await resetNative(ctx, `for preset OFF`);
+  async function applyNative(ctx, force) {
+    const state = getSharedState();
+    if (state.preset === NATIVE_OFF) {
+      await resetNative(ctx, "for preset OFF");
       return;
     }
 
-    const mapping = nativeMapping(preset);
-    if (!mapping) {
-      notify(ctx, `No native mapping for preset "${preset}" — pick a preset first, then /ts native apply.`, "warning");
-      return;
-    }
+    const mapping = nativeMapping(state);
+    const tier = nativeTier(state);
 
     let current;
     try {
@@ -417,11 +545,11 @@ export default function tokenSaverExtension(pi) {
       return;
     }
 
-    // Read once, write only the keys that differ: a preset switch costs one `omp` call plus a handful
+    // Read once, write only the keys that differ: a state change costs one `omp` call plus a handful
     // of writes instead of one call per key.
     const pending = Object.entries(mapping).filter(([key, value]) => current.get(key) !== value);
     if (!pending.length) {
-      if (force) notify(ctx, `Native settings already match preset ${String(preset).toUpperCase()}.`, "info");
+      if (force) notify(ctx, `Native settings already match tier ${tier}.`, "info");
       return;
     }
 
@@ -438,7 +566,7 @@ export default function tokenSaverExtension(pi) {
 
     notify(
       ctx,
-      `Native OMP settings for ${String(preset).toUpperCase()}: ${written.length} key(s) written` +
+      `Native OMP settings for tier ${tier}: ${written.length} key(s) written` +
         `${failed.length ? `, ${failed.length} failed — ${failed.join("; ")}` : ""}\n` +
         `${written.join(" ")}\nFile: ${await nativePathOf()}`,
       failed.length ? "warning" : "info"
@@ -448,9 +576,8 @@ export default function tokenSaverExtension(pi) {
   async function nativeStatus(ctx) {
     const gate = readOptions().native.mode;
     const state = getSharedState();
-    const preset = presetOf(state);
-    const shown = preset || DEFAULT_PRESET;
-    const mapping = nativeMapping(shown);
+    const off = state.preset === NATIVE_OFF;
+    const mapping = nativeMapping(state);
 
     let current;
     try {
@@ -458,28 +585,23 @@ export default function tokenSaverExtension(pi) {
     } catch (error) {
       notify(
         ctx,
-        `Native OMP settings: ${gate} (presets ${gate === "auto" ? "write" : "never write"} config.yml)\n` +
+        `Native OMP settings: ${gate} (${gate === "auto" ? "follows" : "never writes"} config.yml)\n` +
           `Unavailable: ${error?.message || error}`,
         "warning"
       );
       return;
     }
 
-    const header =
-      preset === NATIVE_OFF
-        ? `${NATIVE_KEYS.length} keys reset to OMP defaults`
-        : `${NATIVE_KEYS.length - Object.keys(mapping).length} key(s) left at OMP defaults`;
     const lines = NATIVE_KEYS.map((key) => {
       const have = showValue(current.get(key));
-      const want = preset === NATIVE_OFF ? "OMP default" : nativeText(mapping[key]);
+      const want = off ? "OMP default" : nativeText(mapping[key]);
       return `${have === want ? "=" : "→"} ${key}: ${have} → ${want}`;
     });
     notify(
       ctx,
-      `Native OMP settings: ${gate} (presets ${gate === "auto" ? "write" : "never write"} config.yml)` +
-        ` · preset ${String(shown).toUpperCase()} (${header})` +
-        `${preset ? "" : " — running state is custom, showing the " + DEFAULT_PRESET.toUpperCase() + " mapping"}\n` +
-        `${lines.join("\n")}\nFile: ${await nativePathOf()}\n/ts native apply | reset | on | off`,
+      `Native OMP settings: ${gate} (${gate === "auto" ? "follows" : "never writes"} config.yml)` +
+        ` · tier: ${off ? `${NATIVE_OFF} — every key resets to the OMP default` : nativeTier(state)}` +
+        `\n${lines.join("\n")}\nFile: ${await nativePathOf()}\n/ts native apply | reset | on | off`,
       "info"
     );
   }
@@ -504,7 +626,7 @@ export default function tokenSaverExtension(pi) {
     renderModes(state, ctx);
     notify(ctx, `Preset ${preset.toUpperCase()} applied: ${MODE_KNOBS.map((knob) => `${knob}=${modes[knob]}`).join(" ")}`);
 
-    if (readOptions().native.mode === "auto") await applyNative(preset, ctx, false);
+    if (readOptions().native.mode === "auto") await applyNative(ctx, false);
     await ctx?.reload?.();
   }
 
@@ -521,7 +643,9 @@ export default function tokenSaverExtension(pi) {
       const split = item.indexOf("=");
       const name = canonicalKnob(split > 0 ? item.slice(0, split) : "");
       const raw = split > 0 ? item.slice(split + 1).trim() : "";
-      if (!KNOBS[name]) {
+      // `canonicalKnob` is the guard: a name it cannot resolve is not a knob, and testing
+      // `KNOBS[name]` instead would accept `constructor` and then index a function.
+      if (!name) {
         notify(ctx, `Unknown knob: ${item}. Knobs: ${MODE_KNOBS.join(", ")}`, "warning");
         return;
       }
@@ -535,10 +659,16 @@ export default function tokenSaverExtension(pi) {
 
     for (const [name, mode] of changes) {
       pi.appendEntry("ts-mode", { name, value: mode });
+      // The upstream ponytail plugin reads its own `ponytail-mode` entries for session state, so the
+      // knob needs the same entry a preset writes — a `ts-mode` entry alone is display-only.
+      if (name === "ponytail") pi.appendEntry("ponytail-mode", { mode });
       setSharedMode(name, mode);
     }
     render(ctx);
     notify(ctx, `Set ${changes.map(([name, mode]) => `${name}=${mode}`).join(" ")}`);
+    // A knob is a level of a native behaviour, so opting into auto means /ts set writes too, not just
+    // /ts preset: the shared state is already published, so applyNative sees the new levels.
+    if (readOptions().native.mode === "auto") await applyNative(ctx, false);
     await ctx?.reload?.();
   }
 
@@ -553,12 +683,12 @@ export default function tokenSaverExtension(pi) {
     let ponytail = null;
 
     if (text === "reset") {
-      clearConfig();
+      if (!reportWrite(ctx, clearConfig())) return;
       ponytail = readConfig().modes.ponytail;
     } else {
       const preset = normalizePreset(text);
       if (preset) {
-        writeConfig({ preset });
+        if (!reportWrite(ctx, writeConfig({ preset }))) return;
         ponytail = presetModes(preset).ponytail;
       } else {
         const items = pairs(text, /[\s,]+/);
@@ -567,7 +697,9 @@ export default function tokenSaverExtension(pi) {
           const split = item.indexOf("=");
           const name = canonicalKnob(split > 0 ? item.slice(0, split) : "");
           const raw = split > 0 ? item.slice(split + 1).trim() : "";
-          if (!KNOBS[name]) {
+          // `canonicalKnob` already answered "is this a knob"; `KNOBS[name]` would answer for
+          // `constructor` too and then index a function.
+          if (!name) {
             notify(ctx, `Unknown knob: ${item}. Knobs: ${MODE_KNOBS.join(", ")}`, "warning");
             return;
           }
@@ -578,7 +710,7 @@ export default function tokenSaverExtension(pi) {
           }
           modes[name] = mode;
         }
-        writeConfig({ modes });
+        if (!reportWrite(ctx, writeConfig({ modes }))) return;
         ponytail = modes.ponytail ?? null;
       }
     }
@@ -600,18 +732,21 @@ export default function tokenSaverExtension(pi) {
     const [group, key] = (split > 0 ? text.slice(0, split) : text).split(".");
     const raw = split > 0 ? text.slice(split + 1).trim() : "";
 
-    if (!group || !key || !DEFAULT_OPTIONS[group] || !(key in DEFAULT_OPTIONS[group])) {
+    // Own-property lookups on both halves: `DEFAULT_OPTIONS.constructor` and a bare `key in group`
+    // both resolve through Object.prototype, which is how a junk group reached the config file.
+    const keys = Object.prototype.hasOwnProperty.call(DEFAULT_OPTIONS, group) ? DEFAULT_OPTIONS[group] : null;
+    if (!key || !keys || !Object.prototype.hasOwnProperty.call(keys, key)) {
       notify(
         ctx,
         `Unknown option: ${text || "(none)"}\nOptions: ${Object.entries(DEFAULT_OPTIONS)
-          .map(([name, keys]) => `${name}.{${Object.keys(keys).join("|")}}`)
+          .map(([name, groupKeys]) => `${name}.{${Object.keys(groupKeys).join("|")}}`)
           .join(", ")}`,
         "warning"
       );
       return;
     }
 
-    const current = DEFAULT_OPTIONS[group][key];
+    const current = keys[key];
     let value;
     if (typeof current === "boolean") {
       if (raw !== "true" && raw !== "false") {
@@ -636,13 +771,21 @@ export default function tokenSaverExtension(pi) {
         return;
       }
     } else {
-      value = raw;
+      // A string option is an enum: `/ts native on` writes "auto", so `native.mode=on` means the
+      // same thing rather than a second word for one setting.
+      value = normalizeOptionValue(group, key, raw);
+      if (!value) {
+        const allowed = OPTION_VALUES[group]?.[key] ?? [];
+        notify(ctx, `${group}.${key} takes ${allowed.join(" | ")} (on and true mean auto).`, "warning");
+        return;
+      }
     }
 
-    const config = writeConfig({ options: { [group]: { [key]: value } } });
+    const result = writeConfig({ options: { [group]: { [key]: value } } });
+    if (!reportWrite(ctx, result)) return;
     notify(
       ctx,
-      `${group}.${key} = ${JSON.stringify(config.options[group][key])} · Config: ${CONFIG_FILE}\n` +
+      `${group}.${key} = ${JSON.stringify(result.config.options[group][key])} · Config: ${CONFIG_FILE}\n` +
         "Applies to new sessions (options describe behaviour, not intensity).",
       "info"
     );
@@ -655,17 +798,17 @@ export default function tokenSaverExtension(pi) {
       return;
     }
     if (text === "on" || text === "auto") {
-      writeConfig({ options: { native: { mode: "auto" } } });
-      notify(ctx, "Native OMP settings: auto — applying a preset now also writes its config.yml keys.", "info");
+      if (!reportWrite(ctx, writeConfig({ options: { native: { mode: "auto" } } }))) return;
+      notify(ctx, "Native OMP settings: auto — a preset or a knob change now also writes its config.yml keys.", "info");
       return;
     }
     if (text === "off") {
-      writeConfig({ options: { native: { mode: "off" } } });
+      if (!reportWrite(ctx, writeConfig({ options: { native: { mode: "off" } } }))) return;
       notify(ctx, "Native OMP settings: off — presets no longer touch config.yml (/ts native apply still does).", "info");
       return;
     }
     if (text === "apply") {
-      await applyNative(presetOf(getSharedState()) || DEFAULT_PRESET, ctx, true);
+      await applyNative(ctx, true);
       return;
     }
     if (text === "reset") {
@@ -766,10 +909,6 @@ export default function tokenSaverExtension(pi) {
 
     if (head === "set") {
       await applySet(rest, ctx);
-      return;
-    }
-    if (head === "default") {
-      applyDefault(rest, ctx);
       return;
     }
     if (head === "option") {

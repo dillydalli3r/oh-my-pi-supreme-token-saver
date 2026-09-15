@@ -19,6 +19,17 @@ const OFF_VALUES = new Set(["off", "disable", "disabled", "false"]);
 const SHELL_SYNTAX = /[|;`]|\$\(|&&/;
 const ALREADY_RTK = /^rtk\s/;
 
+// Shell builtins are handled by the interpreter, never by a CLI binary, so RTK's registry can never
+// have a rewrite for them. Short-circuiting the handful that dominate an agent's bash traffic avoids
+// a process spawn per call; anything not listed still goes to `rtk rewrite`, which stays the source
+// of truth for what is rewritable.
+const SHELL_BUILTINS = new Set([
+  ":", ".", "[", "[[", "alias", "bg", "break", "cd", "command", "continue", "declare", "echo",
+  "eval", "exec", "exit", "export", "false", "fg", "hash", "jobs", "kill", "let", "local", "printf",
+  "pushd", "popd", "pwd", "read", "readonly", "return", "set", "shift", "source", "test", "times",
+  "trap", "true", "type", "ulimit", "umask", "unalias", "unset", "wait",
+]);
+
 const REWRITE_CACHE_MAX = 200;
 const REWRITE_CACHE = new Map();
 
@@ -45,6 +56,7 @@ export default function rtkSessionExtension(pi) {
   let rtk = initial.modes.rtk === "on";
   let autoRtk = initial.modes.autoRtk === "on";
   let options = initial.options;
+  let rtkUnavailable = false;
 
   pi.setLabel?.("RTK session toggle");
 
@@ -59,6 +71,8 @@ export default function rtkSessionExtension(pi) {
 
   function setAutoRtk(next, ctx) {
     autoRtk = Boolean(next);
+    // The cache holds decisions made under the previous exclude list, so it cannot outlive them.
+    REWRITE_CACHE.clear();
     pi.appendEntry("ts-mode", { name: "autoRtk", value: autoRtk ? "on" : "off" });
     setSharedMode("autoRtk", autoRtk ? "on" : "off");
     ctx?.ui?.notify?.(`RTK auto-rewrite ${autoRtk ? "on" : "off"}.`, "info");
@@ -69,21 +83,32 @@ export default function rtkSessionExtension(pi) {
   function isRewriteCandidate(command, trimmed) {
     if (!trimmed || ALREADY_RTK.test(trimmed)) return false;
     if (SHELL_SYNTAX.test(command)) return false;
-    const exclude = options.autoRtk.exclude || [];
+    if (SHELL_BUILTINS.has(trimmed.split(/\s+/, 1)[0])) return false;
+    const exclude = options.autoRtk.exclude;
+    if (!Array.isArray(exclude) || !exclude.length) return true;
     return !exclude.some((entry) => typeof entry === "string" && entry && command.includes(entry));
   }
 
-  async function rewrite(command) {
+  async function rewrite(command, cwd) {
+    // A missing binary cannot start rewriting mid-session, so stop paying a failed spawn per command
+    // until the next restore() (session start/branch/tree) re-reads the environment.
+    if (rtkUnavailable) return null;
     if (!isRewriteCandidate(command, command.trim())) return null;
     if (REWRITE_CACHE.has(command)) return REWRITE_CACHE.get(command);
     let rewritten = null;
     try {
-      const result = await pi.exec(RTK_BINARY, ["rewrite", command], { timeout: options.autoRtk.timeoutMs });
+      // `rtk rewrite` resolves paths against the working tree, so it runs where the command will run.
+      const result = await pi.exec(RTK_BINARY, ["rewrite", command], {
+        timeout: options.autoRtk.timeoutMs,
+        cwd: cwd || pi.cwd,
+      });
       const text = String(result?.stdout || "").trim();
       // Exit 3 is RTK's "rewrote, but not cleanly" code; both mean the rewrite is usable.
       if ((result?.code === 0 || result?.code === 3) && text && text !== command) rewritten = text;
-    } catch {
-      // Missing binary, timeout, or a non-zero spawn: leave the command exactly as written.
+    } catch (error) {
+      // Missing binary, timeout, or a non-zero spawn: leave the command exactly as written. Only a
+      // genuinely absent binary disables the rest of the session; a timeout may not repeat.
+      if (/ENOENT|not found|no such file/i.test(String(error?.message || error))) rtkUnavailable = true;
       rewritten = null;
     }
     cacheSet(command, rewritten);
@@ -164,7 +189,18 @@ export default function rtkSessionExtension(pi) {
         };
       }
       onUpdate?.({ content: [{ type: "text", text: `rtk ${params.args.join(" ")}` }], details: { phase: "start" } });
-      const result = await pi.exec(RTK_BINARY, params.args, { signal, cwd: ctx?.cwd || pi.cwd });
+      let result;
+      try {
+        result = await pi.exec(RTK_BINARY, params.args, { signal, cwd: ctx?.cwd || pi.cwd });
+      } catch (error) {
+        // A missing binary or a killed spawn must come back as a tool error, not as a throw into the
+        // agent loop — the model can recover from a message, not from an exception.
+        return {
+          isError: true,
+          content: [{ type: "text", text: `rtk could not run (${error?.message || error}). Install it with the pack installer, or use bash.` }],
+          details: { failed: true, rtk },
+        };
+      }
       const text = [result.stdout, result.stderr].filter(Boolean).join(result.stdout && result.stderr ? "\n" : "");
       return {
         isError: result.code !== 0,
@@ -174,12 +210,12 @@ export default function rtkSessionExtension(pi) {
     },
   });
 
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", async (event, ctx) => {
     if (!autoRtk) return;
     if (event?.toolName !== "bash") return;
     const command = event?.input?.command;
     if (typeof command !== "string" || !command.trim()) return;
-    const rewritten = await rewrite(command);
+    const rewritten = await rewrite(command, ctx?.cwd);
     if (!rewritten || rewritten === command) return;
     // Never mutate the caller's object: the session records the original input.
     return { input: { ...event.input, command: rewritten } };
@@ -190,6 +226,9 @@ export default function rtkSessionExtension(pi) {
     rtk = state.rtk === "on";
     autoRtk = state.autoRtk === "on";
     options = readConfig().options;
+    // A new session/branch is a new chance for the binary and the exclude list to be in place.
+    rtkUnavailable = false;
+    REWRITE_CACHE.clear();
   }
 
   // No startup notify: the modes status row already reports the knobs.

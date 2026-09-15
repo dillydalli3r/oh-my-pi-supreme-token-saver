@@ -5,7 +5,7 @@
 
 import test, { after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -92,7 +92,10 @@ function zodStub() {
   return new Proxy({}, { get: () => () => chain });
 }
 
-async function createRuntime(branch = [], files = EXTENSION_FILES) {
+// `sessionId` stands in for `ctx.sessionManager.getSessionId()`: the real OMP passes one, and a
+// second runtime in this process (the docs give a subagent its own) must not republish over the
+// first session's live state.
+async function createRuntime(branch = [], files = EXTENSION_FILES, { sessionId } = {}) {
   const handlers = new Map();
   const commands = new Map();
   const status = new Map();
@@ -137,7 +140,10 @@ async function createRuntime(branch = [], files = EXTENSION_FILES) {
       },
       notify: (text, type) => notifications.push({ text, type }),
     },
-    sessionManager: { getBranch: () => entries },
+    sessionManager: {
+      getBranch: () => entries,
+      ...(sessionId ? { getSessionId: () => sessionId } : {}),
+    },
     setInterval: (fn) => {
       intervals.push(fn);
       return fn;
@@ -516,6 +522,145 @@ test("/ts native status renders the key table and a missing omp degrades to a wa
   assert.match(warning.text, /Unavailable: spawn omp ENOENT/);
 });
 
+// --- Regression pins for the six reproduced defects -------------------------------------------
+// Every handler here is reached through the command surface a user types: a refused name has to
+// warn, change nothing, and leave the process alive.
+
+test("a prototype-chain name is an unknown knob or option, never a crash", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  const before = rt.row();
+
+  await rt.run("ts", "set constructor=off");
+  const refusedKnob = rt.notifications.at(-1);
+  assert.equal(refusedKnob.type, "warning");
+  assert.match(refusedKnob.text, /Unknown knob: constructor=off/);
+  assert.deepEqual(
+    rt.entries.filter((entry) => entry.customType === "ts-mode"),
+    [],
+    "nothing is written to the branch"
+  );
+  assert.equal(rt.row(), before, "the row keeps every knob it had");
+
+  for (const line of ["option compress.toString=9", "option constructor.name=x"]) {
+    await rt.run("ts", line);
+    const refusedOption = rt.notifications.at(-1);
+    assert.equal(refusedOption.type, "warning", line);
+    assert.match(refusedOption.text, /Unknown option/, line);
+  }
+  assert.equal(existsSync(CONFIG_FILE), false, "a refused option writes nothing");
+
+  // A branch entry naming an inherited property must not take a session down either.
+  const branch = [{ type: "custom", customType: "ts-mode", data: { name: "constructor", value: "off" }, id: "entry-0" }];
+  const replay = await createRuntime(branch);
+  await replay.start();
+  assert.equal(replay.row(), before, "the entry is ignored, not indexed");
+});
+
+test("a wrong-shaped autoRtk.exclude is refused at read time, not applied as a list", async () => {
+  writeFileSync(CONFIG_FILE, JSON.stringify({ version: 2, options: { autoRtk: { exclude: { "git log": true } } } }));
+  const { readOptions } = await import(pathToFileURL(join(EXT, "shared", "session-state.js")).href);
+  assert.deepEqual(readOptions().autoRtk.exclude, [], "an object where a list of strings belongs falls back");
+
+  const rt = await createRuntime();
+  await rt.start();
+  rt.setExec(async (_command, args) => ({
+    code: 0,
+    stdout: args.includes("rewrite") ? "rtk git log --all" : "",
+    stderr: "",
+  }));
+
+  rt.clearExecCalls();
+  const [result] = await rt.emit("tool_call", { toolName: "bash", input: { command: "git log --all" } });
+  assert.deepEqual(result, { input: { command: "rtk git log --all" } }, "the object is not an exclusion list");
+  assert.equal(rt.execCalls.length, 1, "the handler ran past the exclude check instead of throwing");
+
+  // Nothing about the shape can silently stop rewriting: the knob is the only gate.
+  await rt.run("ts", "set autoRtk=off");
+  rt.clearExecCalls();
+  const [off] = await rt.emit("tool_call", { toolName: "bash", input: { command: "git log --all" } });
+  assert.equal(off, undefined);
+  assert.deepEqual(rt.execCalls, []);
+});
+
+test("/ts default reports the preset a fresh session actually renders", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  // Every knob of `lite` written as per-knob defaults: the file keeps the old `max` name, so the
+  // report has to come from the modes themselves.
+  await rt.run(
+    "ts",
+    "default caveman=lite rtk=on ponytail=lite read=off compress=lite prune=off autoRtk=on status=full"
+  );
+  assert.match(rt.notifications.at(-1).text, /Default for new sessions: LITE/);
+
+  const fresh = await createRuntime();
+  await fresh.start();
+  assert.match(fresh.row(), /^🧩 LITE · /, "the report and the rendered row agree");
+});
+
+test("/ts option native.mode is an enum, and `on` means auto", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  const stored = () => JSON.parse(readFileSync(CONFIG_FILE, "utf8")).options.native.mode;
+
+  await rt.run("ts", "option native.mode=on");
+  assert.equal(stored(), "auto", "`on` is the same word `/ts native on` writes");
+
+  for (const value of ["nope", "", "yes please"]) {
+    await rt.run("ts", `option native.mode=${value}`);
+    const refused = rt.notifications.at(-1);
+    assert.equal(refused.type, "warning", value);
+    assert.match(refused.text, /native\.mode takes off \| auto/);
+    assert.equal(stored(), "auto", `a refused value changes nothing: ${value}`);
+  }
+});
+
+test("an unwritable config path warns instead of throwing out of the handler", async () => {
+  // A directory at the config path: the temp file is writable, the rename over it is not.
+  const reported = [];
+  let leftovers = [];
+  mkdirSync(CONFIG_FILE, { recursive: true });
+  try {
+    const rt = await createRuntime();
+    await rt.start();
+    for (const line of ["default lite", "default reset", "option autoRtk.timeoutMs=5000", "native on"]) {
+      await rt.run("ts", line);
+      reported.push({ line, ...rt.notifications.at(-1) });
+    }
+    leftovers = readdirSync(SANDBOX).filter((name) => name.includes(".tmp"));
+  } finally {
+    rmSync(CONFIG_FILE, { recursive: true, force: true });
+  }
+
+  for (const { line, type, text } of reported) {
+    assert.equal(type, "warning", line);
+    assert.match(text, /Config not written/, line);
+    assert.ok(text.includes(CONFIG_FILE), `${line} names the path it could not write`);
+  }
+  assert.deepEqual(leftovers, [], "no temp file survives the failed write");
+});
+
+test("a second session in one process does not republish over the live state", async () => {
+  const first = await createRuntime([], EXTENSION_FILES, { sessionId: "session-1" });
+  await first.start();
+  await first.run("ts", "set caveman=off");
+  const row = first.row();
+  assert.match(row, /^🧩 CUSTOM · 🦴 caveman: OFF · /);
+
+  const second = await createRuntime([], EXTENSION_FILES, { sessionId: "session-2" });
+  await second.start();
+
+  assert.equal(first.row(), row, "the first session's row is untouched");
+  // A later render reads the shared state again, so a clobber would show up here.
+  await first.emit("turn_end", {});
+  assert.equal(first.row(), row, "and stays untouched on the next render");
+  await first.run("ts", "status");
+  assert.match(first.notifications.at(-1).text, /Token Saver: CUSTOM/);
+  assert.equal(second.row(), row, "the second session joins the state already running");
+});
+
 // Last: reads back every pi.exec call the whole file made. Nothing above may drive `omp config
 // set` / `reset` — only the tests that stub `omp` explicitly would be allowed to.
 test("no test path writes native OMP settings", () => {
@@ -663,4 +808,138 @@ test("/combo refuses the headroom verb like the other non-preset verbs", async (
   assert.match(refused.text, /Unknown preset: headroom/);
   assert.equal(rt.row(), running, "a refused verb changes nothing");
   assert.deepEqual(rt.execCalls, []);
+});
+
+// The knobs select OMP's own settings, so these tests read back the `omp config set` calls the
+// extension makes rather than our tables: a stub `omp` reports config.yml and records the writes.
+const nativeWrites = (rt) =>
+  rt.execCalls
+    .filter((call) => call.args.includes("set") && call.args.includes("config"))
+    .map((call) => {
+      const at = call.args.indexOf("set");
+      return `${call.args[at + 1]}=${call.args[at + 2]}`;
+    });
+
+const stale = (value) => (value === "true" ? true : value === "false" ? false : Number.isNaN(Number(value)) ? value : Number(value));
+
+const stubOmp = (rt, values = {}) => {
+  const stored = new Map(Object.entries(values));
+  rt.setExec(async (_command, args) => {
+    const argv = args.join(" ");
+    if (argv.endsWith("config path")) return { code: 0, stdout: join(SANDBOX, "agent"), stderr: "" };
+    if (argv.includes("config list")) {
+      const entries = [...stored].map(([key, value]) => [key, { value }]);
+      return { code: 0, stdout: JSON.stringify(Object.fromEntries(entries)), stderr: "" };
+    }
+    if (argv.includes("config set")) {
+      const at = args.indexOf("set");
+      stored.set(args[at + 1], stale(args[at + 2]));
+      return { code: 0, stdout: "{}", stderr: "" };
+    }
+    return { code: 0, stdout: "{}", stderr: "" };
+  });
+  return stored;
+};
+
+test("the read knob's level picks read.summarize.*, and auto makes /ts set write them", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  stubOmp(rt, {
+    "read.summarize.enabled": true,
+    "read.summarize.prose": true,
+    "read.summarize.minTotalLines": 60,
+    "read.summarize.unfoldLimit": 60,
+    "read.defaultLimit": 200,
+  });
+
+  // read=off: no summariser at all, and the size dials back at their conservative values.
+  await rt.run("ts", "set read=off");
+  rt.clearExecCalls();
+  await rt.run("ts", "native apply");
+  const off = nativeWrites(rt);
+  assert.ok(off.includes("read.summarize.enabled=false"), off.join(" "));
+  assert.ok(off.includes("read.summarize.prose=false"));
+  assert.ok(off.includes("read.summarize.minTotalLines=100"));
+  assert.ok(off.includes("read.defaultLimit=300"));
+
+  // Once the user opts into auto, a knob set writes without a second verb.
+  await rt.run("ts", "native on");
+  rt.clearExecCalls();
+  await rt.run("ts", "set read=lite");
+  assert.deepEqual(nativeWrites(rt), ["read.summarize.enabled=true"], "lite differs from off by summarising at all");
+
+  rt.clearExecCalls();
+  await rt.run("ts", "set read=full");
+  const full = nativeWrites(rt);
+  assert.ok(full.includes("read.summarize.prose=true"), full.join(" "));
+  assert.ok(full.includes("read.summarize.minTotalLines=60"));
+
+  // A preset supplies the levels too; the shared preset table ships `lite` with read=off, so it
+  // writes the same key a read=off would.
+  rt.clearExecCalls();
+  await rt.run("ts", "preset lite");
+  assert.ok(nativeWrites(rt).includes("read.summarize.enabled=false"), nativeWrites(rt).join(" "));
+});
+
+test("the compress knob alone picks the spill keys, so ultra and medium differ", async () => {
+  for (const [preset, before, threshold, outline] of [
+    ["ultra", { "tools.artifactSpillThreshold": 20, "shellMinimizer.sourceOutlineLevel": "default" }, "10", "aggressive"],
+    ["medium", { "tools.artifactSpillThreshold": 10, "shellMinimizer.sourceOutlineLevel": "aggressive" }, "20", "default"],
+  ]) {
+    const rt = await createRuntime();
+    await rt.start();
+    stubOmp(rt, before);
+
+    await rt.run("ts", `preset ${preset}`);
+    rt.clearExecCalls();
+    await rt.run("ts", "native apply");
+
+    const called = nativeWrites(rt);
+    assert.ok(called.includes(`tools.artifactSpillThreshold=${threshold}`), `${preset}: ${called.join(" ")}`);
+    assert.ok(called.includes(`shellMinimizer.sourceOutlineLevel=${outline}`), preset);
+  }
+});
+
+test("a knob set next to a preset keeps the preset's tier dials and says the state is custom", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  stubOmp(rt, { "task.softRequestBudget": 200, "tools.intentTracing": false });
+
+  // `max` is the built-in default tier, so a custom state falls back to its dials rather than
+  // inventing a tier from the one knob that changed.
+  await rt.run("ts", "set caveman=wenyan");
+  assert.match(rt.row(), /^🧩 CUSTOM · /);
+  rt.clearExecCalls();
+  await rt.run("ts", "native apply");
+  assert.ok(nativeWrites(rt).includes("task.softRequestBudget=150"), nativeWrites(rt).join(" "));
+  assert.match(rt.notifications.at(-1).text, /tier max \(state is custom\)/);
+
+  await rt.run("ts", "native status");
+  const table = rt.notifications.at(-1).text;
+  assert.match(table, /tier: max \(state is custom\)/);
+  assert.match(table, /task\.softRequestBudget: 150 → 150|task\.softRequestBudget: 200 → 150/);
+});
+
+test("/ts set ponytail writes the entry the ponytail plugin reads", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  await rt.run("ts", "set ponytail=full");
+  assert.deepEqual(
+    rt.entries.filter((entry) => entry.customType === "ponytail-mode").map((entry) => entry.data),
+    [{ mode: "full" }],
+    "the plugin's own custom type carries the running session's level"
+  );
+});
+
+test("/ts option rejects a group that no longer exists", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  await rt.run("ts", "option compress.maxLines=100");
+  const refused = rt.notifications.at(-1);
+  assert.equal(refused.type, "warning");
+  assert.match(refused.text, /Unknown option: compress\.maxLines=100/);
+  assert.match(refused.text, /autoRtk\.\{timeoutMs\|exclude\}/);
+  assert.equal(existsSync(CONFIG_FILE), false, "a rejected option writes nothing");
 });

@@ -222,7 +222,8 @@ async function updatePonytail(pi, ctx, dryRun = false) {
   notify(ctx, "Ponytail: running npm install…", "info");
   let out = "";
   try {
-    const r = await pi.exec("npm", ["install", "@dietrichgebert/ponytail@latest", "--save", "--no-audit", "--no-fund"], { cwd: pluginsDir });
+    const [command, argv] = cliCommand("npm", ["install", "@dietrichgebert/ponytail@latest", "--save", "--no-audit", "--no-fund"]);
+    const r = await pi.exec(command, argv, { cwd: pluginsDir });
     out = [r.stdout, r.stderr].filter(Boolean).join("\n").trim();
     if (r.code !== 0) throw new Error(r.stderr || `npm exited ${r.code}`);
   } catch (e) {
@@ -438,6 +439,14 @@ async function updateCaveman(ctx, dryRun = false) {
   }
 }
 
+// Windows resolves npm/npx to .cmd shims that a shell-less spawn cannot execute (Node refuses .cmd
+// without a shell), so those commands go through cmd.exe there. The installer's execCli applies the
+// same fix for the same reason; without it `/ai-addons update` fails on every Windows install.
+function cliCommand(name, args) {
+  const argv = args.map((arg) => (/\s/.test(arg) ? `"${arg}"` : arg));
+  return IS_WINDOWS ? [process.env.ComSpec || "cmd.exe", ["/c", name, ...argv]] : [name, argv];
+}
+
 // Same path the installer uses: npx runs the pack's own `update`. GitHub source first (the fork
 // publishes from there), npm package as the fallback once it is published. Writes never happen here
 // — the installer owns ~/.omp/agent/extensions/token-saver/.
@@ -459,7 +468,8 @@ async function updateTokenSaver(pi, ctx, dryRun = false) {
   for (const source of sources) {
     notify(ctx, `Token saver: running npx ${source.label} update…`, "info");
     try {
-      const r = await pi.exec("npx", source.args);
+      const [command, argv] = cliCommand("npx", source.args);
+      const r = await pi.exec(command, argv);
       const out = [r.stdout, r.stderr].filter(Boolean).join("\n").trim();
       if (r.code !== 0) throw new Error(r.stderr || `npx exited ${r.code}`);
       const m = `Token saver updated via ${source.label}.${out ? `\n${out}` : ""}\n${RELOAD_MSG}`;

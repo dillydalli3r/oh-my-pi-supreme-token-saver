@@ -40,11 +40,13 @@ export default function modeReinforcementExtension(pi) {
   pi.setLabel?.("Supreme Token Saver mode reinforcement");
 
   pi.on("before_agent_start", async (event, ctx) => {
-    if (!ctx?.hasUI) return;
+    // No `ctx.hasUI` guard: this handler only appends to the model-facing prompt and never touches
+    // the UI, and headless/print/subagent runs report hasUI === false — exactly the runs that most
+    // need the modes restated after a compaction.
     const base = [].concat(event.systemPrompt ?? []);
     if (base.some((prompt) => typeof prompt === "string" && prompt.includes(MARKER))) return;
 
-    reconcileSharedEntries(entriesFrom(ctx));
+    reconcileSharedEntries(entriesFrom(ctx), ctx?.sessionManager?.getSessionId?.());
     // One line per mode set, byte-stable for a given set: re-asserting it after a compaction (or on
     // any later turn) appends the same bytes, so it never invalidates the cached prompt prefix.
     const text = instruction(getSharedState(), isOmpSubagentPrompt(base));

@@ -4,10 +4,12 @@ A fork of [`@fernado03/oh-my-pi-supreme-token-saver`](https://www.npmjs.com/pack
 for [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi). It ships six presets (`off` → `ultra`) over
 eight knobs — `caveman`, `rtk`, `ponytail`, `read`, `compress`, `prune`, `autoRtk`, `status` — behind one
 command surface (`/token-saver`, alias `/ts`; `/combo` kept as a preset-only alias) and one footer row.
-A preset also drives OMP's **own** native token-economy settings (`read.summarize.*`,
-`shellMinimizer.*`, `compaction.*`, artifact spill, `task.*`, `skillful`) through `omp config`, gated by
-`options.native.mode`. On top of that it adds three prompt-level add-ons — caveman terseness, RTK shell
-guidance, Ponytail code minimalism — and a passive Amanai reward detector that only raises a local notice
+The `read`, `compress` and `prune` knobs drive OMP's **own** native token-economy settings
+(`read.summarize.*`, `shellMinimizer.*`, `compaction.*`, artifact spill, `read.defaultLimit`) through
+`omp config`, gated by `options.native.mode`; the preset supplies those knobs' starting levels plus four
+tier dials (`task.*`, `tools.intentTracing`, `skillful`) that no single knob owns. On top of that it adds
+three prompt-level add-ons — caveman terseness, RTK shell guidance, Ponytail code minimalism — and a
+passive Amanai reward detector that only raises a local notice
 when a completed final response contains a footer-shaped `AMANAI-GACHA-…` key; it never stores, sends, or
 redeems the key. The pack reports no measured saving of its own.
 
@@ -18,8 +20,12 @@ structural read summaries (`read.summarize.*`), the shell-output minimizer (`she
 spill (`tools.artifact*`), and cache-aware pruning of stale reads (`compaction.supersedeReads`,
 `compaction.dropUseless`), all ON by default. Verified against a stock `omp config`:
 `read.summarize.enabled=true`, `shellMinimizer.enabled=true`, `compaction.supersedeReads=true`,
-`compaction.dropUseless=true`. This pack's job is to keep them on and tune their thresholds per preset —
-the `lite` column of the native table below is exactly the stock configuration.
+`compaction.dropUseless=true`. This pack runs none of that itself: the `read`, `compress` and `prune` knobs
+select those host settings and tune their thresholds, key by key, under [Native settings](#native-settings).
+One honest consequence: a knob level named `off` writes `false` into its keys, so a preset carrying
+`read=off` / `prune=off` (presets `off`, `lite`, and `medium` for `prune`) turns the host's summaries and
+pruning **off** rather than leaving stock behaviour alone. Stock behaviour is what preset `off` restores,
+by resetting those keys instead of writing values.
 
 Measured evidence, so you can calibrate expectations:
 
@@ -97,6 +103,10 @@ Accepted values per knob: `caveman` `off|lite|full|ultra|wenyan` · `rtk` `off|o
 
 The stored default for new sessions is `max` until changed with `/ts default <preset>`.
 
+The `read`, `compress` and `prune` columns are **knob levels, not OMP settings**: each level names the exact
+native keys it writes (see [Native settings](#native-settings)), and preset `off` pins nothing — it resets
+those mapped keys to the host defaults instead of writing anti-defaults.
+
 ## Commands
 
 One surface. `/token-saver` and `/ts` are identical; `/combo` accepts preset names only and rejects the
@@ -111,12 +121,14 @@ other verbs.
 | `/ts default <preset>` | Store a preset as the default for new sessions |
 | `/ts default <knob>=<value> …` | Store a partial override (displays as `custom`) |
 | `/ts default reset` | Delete the config file; back to built-in `max` |
-| `/ts option <group>.<key>=<value>` | Set a behaviour option (`compress.*`, `prune.*`, `read.*`, `autoRtk.*`, `status.*`, `native.mode`) |
+| `/ts option <group>.<key>=<value>` | Set a behaviour option for new sessions — `autoRtk.timeoutMs`, `autoRtk.exclude`, `native.mode` (the whole option list) |
 | `/ts native [status\|on\|off\|apply\|reset]` | Inspect/apply OMP's own settings; `on` is an alias for `auto` |
 | `/ts headroom [status\|unwrap\|wrap\|install]` | Optional external Headroom proxy: report status, `unwrap` in-session; `wrap`/`install` refuse and name the command to run yourself (see [Optional: Headroom](#optional-headroom)) |
 | `/ts help` | Usage, knob list, option list |
 
-Applying a preset or `set` persists session entries and reloads the session.
+Applying a preset or `set` persists session entries and reloads the session. `/ts set ponytail=<mode>`
+additionally appends the `ponytail-mode` entry the upstream Ponytail plugin reads for its own session
+state — without it the knob change would be display-only.
 
 Individual add-ons:
 
@@ -135,41 +147,76 @@ sets it back to `off` for the session.
 ## Native settings
 
 `omp config` is the only writer of `~/.omp/agent/config.yml` (path confirmed via `omp config path`).
-When a preset is applied, the pack writes the keys below **only if `options.native.mode` is `auto`**.
-The default is `off`: presets then never touch your OMP config, and `/ts native apply` is the only way to
-write it.
+**The knobs are the dial.** Each level of the `read`, `compress` and `prune` knobs names exactly which OMP
+keys that level writes; the preset supplies the level each knob starts at (the [presets table](#presets))
+plus the four tier dials that no single knob owns (`tools.intentTracing`, `task.maxEffort`,
+`task.softRequestBudget`, `skillful`). A state that is not exactly one of the six presets keeps the dials of
+the built-in `max` tier, and `/ts native status` reports it as `tier: max (state is custom)`.
 
-| Key | lite | medium | high | max | ultra | What it is |
+The pack writes these keys **only if `options.native.mode` is `auto`**. The default is `off`: presets then
+never touch your OMP config, and `/ts native apply` is the only way to write it.
+
+### Knob `read` — structural read summaries
+
+Levels: `off` · `lite` · `full`.
+
+| OMP key | off | lite | full | What it is |
+|---|---|---|---|---|
+| `read.summarize.enabled` | false | true | true | Structural code summaries for selector-less reads |
+| `read.summarize.prose` | false | false | true | Structural summaries for Markdown/plain-text reads |
+| `read.summarize.minTotalLines` | 100 | 100 | 60 | Files shorter than this are read verbatim instead of summarized |
+| `read.summarize.unfoldLimit` | 100 | 100 | 60 | Ceiling on summary size while BFS-unfolding; larger spans stay folded |
+| `read.defaultLimit` | 300 | 300 | 200 | Default line count for a read with no limit |
+
+### Knob `compress` — shell output and artifact spill
+
+Levels: `off` · `lite` · `full` · `ultra`.
+
+| OMP key | off | lite | full | ultra | What it is |
+|---|---|---|---|---|---|
+| `shellMinimizer.enabled` | false | true | true | true | Compress verbose shell output (git, npm, cargo, …) before returning it |
+| `shellMinimizer.sourceOutlineLevel` | default | default | default | aggressive | Source outline mode for `cat`/`read` of source files |
+| `tools.artifactSpillThreshold` | 50 | 50 | 20 | 10 | Tool output above this size spills to an artifact, tail kept inline |
+| `tools.artifactTailBytes` | 20 | 20 | 12 | 8 | Tail content kept inline when output spills |
+| `tools.artifactHeadBytes` | 20 | 20 | 12 | 0 | Head kept inline alongside the tail; `0` = tail only |
+| `tools.artifactTailLines` | 500 | 500 | 300 | 200 | Maximum tail lines kept inline when output spills |
+
+### Knob `prune` — cache-aware elision of stale results
+
+Levels: `off` · `lite` · `full` · `ultra`.
+
+| OMP key | off | lite | full | ultra | What it is |
+|---|---|---|---|---|---|
+| `compaction.supersedeReads` | false | true | true | true | Prune older read results when the same file is read again (cache-aware) |
+| `compaction.dropUseless` | false | false | true | true | Prune tool results flagged contextually useless (no matches, timed-out waits) |
+| `compaction.keepRecentTokens` | 20000 | 20000 | 12000 | 8000 | Verbatim-history floor left after a compaction |
+| `compaction.idleEnabled` | false | false | false | true | Compact while idle when the token count exceeds threshold |
+
+`compaction.keepRecentTokens` is the main dial on post-compaction context size: it is the verbatim-history
+floor left after a compaction, and everything above that floor is what a compaction may elide.
+
+### Tier dials — per preset, not per knob
+
+| OMP key | lite | medium | high | max | ultra | What it is |
 |---|---|---|---|---|---|---|
-| `read.summarize.enabled` | true | true | true | true | true | Structural code summaries for selector-less reads |
-| `read.summarize.prose` | false | false | false | true | true | Structural summaries for Markdown/plain-text reads |
-| `read.summarize.minTotalLines` | 100 | 100 | 80 | 60 | 40 | Files shorter than this are read verbatim instead of summarized |
-| `read.summarize.unfoldLimit` | 100 | 100 | 80 | 60 | 40 | Ceiling on summary size while BFS-unfolding; larger spans stay folded |
-| `read.defaultLimit` | 300 | 300 | 200 | 200 | 200 | Default line count for a read with no limit |
-| `shellMinimizer.enabled` | true | true | true | true | true | Compress verbose shell output (git, npm, cargo, …) before returning it |
-| `shellMinimizer.sourceOutlineLevel` | default | default | default | default | aggressive | Source outline mode for `cat`/`read` of source files |
-| `tools.artifactSpillThreshold` | 50 | 50 | 30 | 20 | 10 | Tool output above this size spills to an artifact, tail kept inline |
-| `tools.artifactTailBytes` | 20 | 20 | 16 | 12 | 8 | Tail content kept inline when output spills |
-| `tools.artifactHeadBytes` | 20 | 20 | 16 | 12 | 0 | Head kept inline alongside the tail; `0` = tail only |
-| `tools.artifactTailLines` | 500 | 500 | 400 | 300 | 200 | Maximum tail lines kept inline when output spills |
 | `tools.intentTracing` | true | true | false | false | false | Ask the agent to describe each tool call's intent before executing it |
-| `compaction.supersedeReads` | true | true | true | true | true | Prune older read results when the same file is read again (cache-aware) |
-| `compaction.dropUseless` | true | true | true | true | true | Prune tool results flagged contextually useless (no matches, timed-out waits) |
-| `compaction.keepRecentTokens` | 20000 | 20000 | 16000 | 12000 | 8000 | Verbatim-history floor left after a compaction |
-| `compaction.idleEnabled` | false | false | false | true | true | Compact while idle when the token count exceeds threshold |
 | `task.maxEffort` | max | max | high | high | medium | Ceiling on the `task` tool's per-spawn reasoning effort |
 | `task.softRequestBudget` | 200 | 200 | 200 | 150 | 90 | Soft request budget per subagent; 1.5× force-stops the run |
 | `skillful` | true | true | true | true | false | List available skills in the system prompt |
 
 Notes that matter:
 
-- `lite` is exactly the OMP stock configuration across all 19 keys, so `/ts native apply` under `lite`
-  writes nothing. `medium` and above are where thresholds actually move.
 - Two defaults are inverted and worth knowing: **`tools.intentTracing` defaults ON** and adds an intent
   string to every tool call — only `high` and above turn it off. **`skillful` defaults ON** and ships the
   skill inventory in the system prompt — only `ultra` drops it, and that is a real functionality tradeoff.
-- Preset `off` writes no anti-defaults: `/ts native reset` (and any `off`-preset native apply) resets
-  exactly these 19 keys to whatever OMP then considers sane, which is more durable than pinning `false`.
+- `tools.artifactHeadBytes=0` under `compress=ultra` means **tail-only spill**: nothing from the head of a
+  spilled output is kept inline.
+- `off` as a *knob level* is a real setting, not a no-op: `read=off` writes `read.summarize.enabled=false`
+  and `prune=off` writes `compaction.supersedeReads=false` plus `compaction.dropUseless=false`. That turns
+  the host's summaries and pruning off — the presets `off` and `lite` carry `read=off`, and `off`, `lite`
+  and `medium` carry `prune=off`.
+- `off` as a *preset* is different: it writes no keys at all and instead resets all 19 keys in these tables
+  to whatever OMP then considers sane, which is more durable than pinning `false`.
 - Deliberately untouched: `provider.appendOnlyContext`, `memory.backend`, `advisor`/`autolearn`/`prewalk`,
   `snapcompact`, and every display/statusLine/tui key — display keys cost no model tokens.
 - `/ts native reset` runs one `omp` process per key (19). A missing `omp` CLI degrades to a warning
@@ -212,7 +259,8 @@ tool output, so it applies to a whole session or to none of it.
 
 This pack's native-settings layer already covers structural read summaries (`read.summarize.*`), shell-output
 minimisation (`shellMinimizer.*`) and pruning of stale results (`compaction.supersedeReads`,
-`compaction.dropUseless`) without an external process, a proxy, or a second config file. For most sessions that is
+`compaction.dropUseless`) without an external process, a proxy, or a second config file — the `read`,
+`compress` and `prune` knobs select those settings, and only under `native.mode=auto`. For most sessions that is
 the better trade. Reach for Headroom when you are on Anthropic and feeding the model large repetitive JSON or log
 dumps.
 
@@ -245,27 +293,40 @@ new `omp`, so running it inside a live session nests OMP inside OMP. After that:
 `~/.omp/agent/token-saver.json`. Only keys that were set appear; the installer seeds the minimal form:
 
 ```json
+{ "version": 2, "preset": "max" }
+```
+
+After `/ts default max`, `/ts default ponytail=off`, `/ts option autoRtk.exclude=[".git"]` and
+`/ts option native.mode=auto`, the same file reads:
+
+```json
 {
   "version": 2,
   "preset": "max",
-  "modes": { "caveman": "ultra", "rtk": "on" },
+  "modes": { "ponytail": "off" },
   "options": {
-    "compress": { "maxLines": 600, "maxBytes": 32768, "keepHead": 300, "keepTail": 150, "minBytes": 2048, "stripAnsi": true, "dedupe": true },
-    "prune": { "keepRecentToolResults": 24, "maxOlderResultBytes": 4096, "dedupeReads": true, "preserveErrors": true },
-    "read": { "skeletonOverBytes": 2048 },
-    "autoRtk": { "timeoutMs": 2000, "exclude": [] },
-    "status": { "showMeter": true, "showSavings": true },
-    "native": { "mode": "off" }
+    "autoRtk": { "exclude": [".git"] },
+    "native": { "mode": "auto" }
   }
 }
 ```
 
 - `preset` replaces every mode; `modes` are per-knob overrides that win over the preset for the keys they
-  set, so a partial config stays a partial override.
-- `/ts default <preset|knob=value|reset>` writes `preset`/`modes`. It changes what **new** sessions start
-  from; the running session is untouched.
-- `/ts option <group>.<key>=<value>` writes `options.<group>.<key>`. Options describe behaviour (sizes,
-  timeouts, dedupe flags), not intensity, so they apply to new sessions rather than the current one.
+  set, so a partial config stays a partial override. Writing a preset with `/ts default <preset>` deletes
+  every mode override, which is what makes it stick.
+- `/ts default <preset|knob=value|reset>` writes `preset`/`modes` (`reset` deletes the file). It changes
+  what **new** sessions start from; the running session is untouched.
+- `/ts option <group>.<key>=<value>` writes `options.<group>.<key>`. Only two groups exist, and the value
+  type decides the syntax: `autoRtk.timeoutMs` takes a number, `autoRtk.exclude` takes a JSON array
+  (`/ts option autoRtk.exclude=[".git","dist"]`), and `native.mode` is a string — `auto` makes presets and
+  knob changes write `config.yml`, anything else (including `off`) leaves it alone. Unknown groups, unknown
+  keys, a non-numeric `timeoutMs`, and an `exclude` that is not a JSON array are rejected with a usage
+  line. Options describe behaviour (timeouts, exclusion lists, the native gate), not intensity. They are
+  stored for the sessions that follow, but two of them are read at different times: `autoRtk.*` is cached
+  when a session starts, while `native.mode` is read at every native write, so flipping it takes effect on
+  the running session's next preset or knob change.
+- The stored defaults are `autoRtk.timeoutMs=2000`, `autoRtk.exclude=[]`, `native.mode=off`, so a fresh
+  file needs no `options` block at all.
 - Choosing a ponytail default also pushes it into the Ponytail plugin's own config, and reports
   `[pending] Ponytail plugin not found` when that write fails.
 - Legacy migration: if `token-saver.json` is absent, the pre-2.0 `~/.omp/agent/combo-defaults.json`

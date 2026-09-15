@@ -15,7 +15,7 @@ import { createRequire } from "node:module";
 const BRIDGE_KEY = Symbol.for("@fernado03/oh-my-pi-supreme-token-saver/combo-session-state");
 const requireFromDir = createRequire(import.meta.url);
 
-export const OMP_SUBAGENT_MARKER = "You are operating on a piece of work assigned to you by the main agent.";
+const OMP_SUBAGENT_MARKER = "You are operating on a piece of work assigned to you by the main agent.";
 
 // Knob -> accepted values. A knob's first value is its off state, and every preset below sets
 // every knob, so `derivePreset` can compare whole states and no knob can be half-configured.
@@ -34,7 +34,7 @@ export const MODE_KNOBS = Object.freeze(Object.keys(KNOBS));
 
 // Presets, lightest first. `lite` is the smallest useful saving; `ultra` trades prompt tokens
 // for behaviour (deferred tool schemas, aggressive pruning) on top of `max`.
-export const PRESETS = Object.freeze({
+const PRESETS = Object.freeze({
   off: Object.freeze({
     caveman: "off", rtk: "off", ponytail: "off", read: "off",
     compress: "off", prune: "off", autoRtk: "off", status: "full",
@@ -69,42 +69,58 @@ export const CONFIG_FILE =
 
 // Pre-2.0 installs stored the same defaults per app. Read once so an upgrade keeps the level the
 // user chose; writes always go to CONFIG_FILE.
-export const LEGACY_DEFAULTS_FILE =
+const LEGACY_DEFAULTS_FILE =
   process.env.OMP_COMBO_DEFAULTS_FILE || path.join(os.homedir(), ".omp", "agent", "combo-defaults.json");
 
-// Numeric/extras each behaviour reads. Kept global (not per session): they describe how a mode
-// behaves, not how much of it is on, and a session that inherits a preset must inherit the shape.
+// Numeric/extras a behaviour actually reads. Only keys with a reader live here: everything else a
+// user could set would be a knob that changes nothing, and `/ts option` would advertise it.
+// The `read` / `compress` / `prune` behaviours are configured through OMP's own settings
+// (read.summarize.*, shellMinimizer.*, compaction.*) — the knob levels drive those, mapped by
+// token-saver, not by this file.
 export const DEFAULT_OPTIONS = Object.freeze({
-  compress: Object.freeze({
-    maxLines: 600, maxBytes: 32768, keepHead: 300, keepTail: 150, minBytes: 2048,
-    stripAnsi: true, dedupe: true,
-  }),
-  prune: Object.freeze({
-    keepRecentToolResults: 24, maxOlderResultBytes: 4096, dedupeReads: true, preserveErrors: true,
-  }),
-  read: Object.freeze({ skeletonOverBytes: 2048 }),
   autoRtk: Object.freeze({ timeoutMs: 2000, exclude: Object.freeze([]) }),
-  status: Object.freeze({ showMeter: true, showSavings: true }),
   // Whether applying a preset also writes the matching OMP settings in ~/.omp/agent/config.yml.
   // `off` keeps the user's own OMP config untouched unless `/ts native apply` asks for it.
   native: Object.freeze({ mode: "off" }),
 });
 
+// Accepted values for the string options. An option that gates a behaviour is an enum, not free
+// text: `/ts native on` already writes "auto", so the option verb has to accept the same word
+// instead of letting a second vocabulary for one setting into the config file.
+export const OPTION_VALUES = Object.freeze({
+  native: Object.freeze({ mode: Object.freeze(["off", "auto"]) }),
+});
+
+// Own-property lookup, never `KNOBS[name]`: `constructor`, `toString` and friends are inherited from
+// Object.prototype, so a bare lookup answers a truthiness test with a function and a `.includes`
+// call on it throws out of the command handler.
+const owns = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+
 export function normalizeMode(name, value) {
+  if (!owns(KNOBS, name)) return null;
   if (name === "rtk" || name === "autoRtk") {
     if (typeof value === "boolean") return value ? "on" : "off";
     if (value === "true") return "on";
     if (value === "false") return "off";
   }
   const mode = String(value ?? "").trim().toLowerCase();
-  return KNOBS[name]?.includes(mode) ? mode : null;
+  return KNOBS[name].includes(mode) ? mode : null;
+}
+
+// The value to store for a string option, or null when it takes no such value.
+export function normalizeOptionValue(group, key, value) {
+  const allowed = owns(OPTION_VALUES, group) && owns(OPTION_VALUES[group], key) ? OPTION_VALUES[group][key] : null;
+  if (!allowed) return null;
+  const text = String(value ?? "").trim().toLowerCase();
+  if ((text === "on" || text === "true") && allowed.includes("auto")) return "auto";
+  return allowed.includes(text) ? text : null;
 }
 
 // Knob names are camelCase (`autoRtk`), but users type them in any case. Resolve the name once here
 // so every command parser accepts `/ts set autortk=off` and `/ts set autoRtk=off` alike.
 export function canonicalKnob(name) {
   const raw = String(name ?? "").trim();
-  if (KNOBS[raw]) return raw;
+  if (owns(KNOBS, raw)) return raw;
   const lowered = raw.toLowerCase();
   return MODE_KNOBS.find((knob) => knob.toLowerCase() === lowered) || null;
 }
@@ -115,7 +131,7 @@ export function normalizePreset(value) {
 }
 
 // Whole-state comparison: a state that matches a preset reports that preset, anything else is custom.
-export function derivePreset(modes) {
+function derivePreset(modes) {
   for (const name of PRESET_NAMES) {
     const preset = PRESETS[name];
     if (MODE_KNOBS.every((knob) => preset[knob] === modes[knob])) return name;
@@ -129,7 +145,7 @@ export function presetModes(name) {
 }
 
 // `modes` wins over the preset for the keys it sets, so a partial config stays a partial override.
-export function resolveModes({ preset = DEFAULT_PRESET, modes } = {}) {
+function resolveModes({ preset = DEFAULT_PRESET, modes } = {}) {
   const base = presetModes(preset) || presetModes(DEFAULT_PRESET);
   const resolved = { ...base };
   for (const knob of MODE_KNOBS) {
@@ -163,15 +179,22 @@ function readStored() {
   return { modes };
 }
 
+// A stored value must keep the shape of its default. `typeof` alone is enough for scalars but calls
+// both an array and a plain object "object", which let `{"git log": true}` in where a list of
+// strings belongs — and the consumer then called `.some` on an object.
+function matchesShape(expected, value) {
+  if (Array.isArray(expected)) return Array.isArray(value);
+  return !Array.isArray(value) && typeof value === typeof expected;
+}
+
 export function readOptions() {
   const stored = readStored().options || {};
   const options = {};
   for (const group of Object.keys(DEFAULT_OPTIONS)) {
     const merged = { ...DEFAULT_OPTIONS[group] };
     for (const [key, value] of Object.entries(stored[group] || {})) {
-      if (!(key in merged)) continue;
-      const expected = typeof merged[key];
-      if (typeof value === expected) merged[key] = value;
+      if (!owns(merged, key)) continue;
+      if (matchesShape(merged[key], value)) merged[key] = value;
     }
     options[group] = Object.freeze(merged);
   }
@@ -184,7 +207,10 @@ export function readConfig() {
   const preset = normalizePreset(stored.preset) || DEFAULT_PRESET;
   const modes = resolveModes({ preset, modes: stored.modes });
   return Object.freeze({
-    preset: derivePreset(modes) === "custom" ? "custom" : preset,
+    // Report what the stored state derives, not the stored name: per-knob defaults that spell out a
+    // whole preset leave the old name behind, and `/ts default` must not print a preset a fresh
+    // session would not render. Whole-state derivation already answers `custom` when nothing matches.
+    preset: derivePreset(modes),
     modes: Object.freeze(modes),
     options: readOptions(),
   });
@@ -216,21 +242,57 @@ export function writeConfig(patch = {}) {
 
   const options = { ...(isPlainObject(stored.options) ? stored.options : {}) };
   for (const [group, values] of Object.entries(patch.options || {})) {
-    if (!DEFAULT_OPTIONS[group]) continue;
+    // Own-property lookup: a group named `constructor` is not one of ours, and `Object.prototype`
+    // must not put a group into the file just because the name resolves to something.
+    if (!owns(DEFAULT_OPTIONS, group)) continue;
     options[group] = { ...(isPlainObject(options[group]) ? options[group] : {}), ...values };
   }
   if (Object.keys(options).length) next.options = options;
 
-  fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, `${JSON.stringify(next, null, 2)}\n`, "utf8");
-  fs.rmSync(LEGACY_DEFAULTS_FILE, { force: true });
-  return readConfig();
+  let error = null;
+  try {
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+    writeAtomic(CONFIG_FILE, `${JSON.stringify(next, null, 2)}\n`);
+    fs.rmSync(LEGACY_DEFAULTS_FILE, { force: true });
+  } catch (caught) {
+    error = shortError(caught);
+  }
+  return { config: readConfig(), error };
 }
 
 export function clearConfig() {
-  fs.rmSync(CONFIG_FILE, { force: true });
-  fs.rmSync(LEGACY_DEFAULTS_FILE, { force: true });
-  return readConfig();
+  let error = null;
+  try {
+    fs.rmSync(CONFIG_FILE, { force: true });
+    fs.rmSync(LEGACY_DEFAULTS_FILE, { force: true });
+  } catch (caught) {
+    error = shortError(caught);
+  }
+  return { config: readConfig(), error };
+}
+
+// Syscall, not stack: the caller names the file it could not write, and the message stays one line.
+function shortError(error) {
+  return String(error?.message || error).split(",")[0];
+}
+
+// A direct `writeFileSync` onto the config truncates the user's file before it knows the write will
+// fail, and a directory or read-only path throws out of the command handler. Write a sibling temp
+// file and rename it over the target instead: the rename is the only step that can leave the old
+// file in place, and every failure reaches the caller as a message.
+function writeAtomic(file, text) {
+  const temp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temp, text, "utf8");
+    fs.renameSync(temp, file);
+  } catch (error) {
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {
+      // The half-written temp file is the lesser problem; report the write failure itself.
+    }
+    throw error;
+  }
 }
 
 function isPlainObject(value) {
@@ -239,7 +301,7 @@ function isPlainObject(value) {
 
 // Location of the ponytail plugin's own modules. OMP_PONYTAIL_PACKAGE_DIR overrides it (tests,
 // non-standard plugin locations).
-export function ponytailPackageFile(file) {
+function ponytailPackageFile(file) {
   const dir = process.env.OMP_PONYTAIL_PACKAGE_DIR ||
     path.join(os.homedir(), ".omp", "plugins", "node_modules", "@dietrichgebert", "ponytail");
   return path.join(dir, file);
@@ -248,7 +310,7 @@ export function ponytailPackageFile(file) {
 // The ponytail plugin owns the ponytail default (its config.json / PONYTAIL_DEFAULT_MODE), so read
 // it back rather than trusting a second copy: a fresh session must never claim a ponytail level the
 // plugin is not running.
-export function readPonytailPluginDefault() {
+function readPonytailPluginDefault() {
   try {
     return normalizeMode("ponytail", requireFromDir(ponytailPackageFile("hooks/ponytail-config.js")).getDefaultMode?.());
   } catch {
@@ -274,7 +336,7 @@ export function syncPonytailDefault(mode) {
 function bridge() {
   const existing = globalThis[BRIDGE_KEY];
   if (existing?.state) return existing;
-  return (globalThis[BRIDGE_KEY] = { state: defaultState(), listener: null, usage: null, savings: null });
+  return (globalThis[BRIDGE_KEY] = { state: defaultState(), listener: null, usage: null, owner: null });
 }
 
 function defaultState() {
@@ -328,26 +390,38 @@ export function getSharedUsage() {
   return bridge().usage;
 }
 
-// Measured RTK savings (`rtk gain`), refreshed in the background; null until a reading lands.
-export function setSharedSavings(savings) {
-  bridge().savings = savings || null;
-}
-
-export function getSharedSavings() {
-  return bridge().savings;
-}
+// The custom types that carry a statement about the level to run at; anything else in a branch
+// (messages, other add-ons' entries) says nothing about this state.
+const STATE_ENTRY_TYPES = Object.freeze([
+  "ts-preset", "combo-level", "ts-mode", "caveman-mode", "rtk-mode", "ponytail-mode",
+]);
 
 // Fold persisted session entries back into the shared state. Legacy custom types from pre-2.0
 // sessions are still honoured so an existing branch reopens at the level it was left at.
-export function reconcileSharedEntries(entries) {
+// A branch with no state entry of its own makes no claim about the level: a second session in this
+// process (a subagent runner, per the docs) would otherwise re-apply the stored defaults over the
+// first session's live override. Once a session owns the state, only that same id may republish —
+// a caller passing no id (rtk-session, caveman-session) folds in the stored defaults and nothing of
+// its own, so it is not the owner either. The session that owns entries, or the first one in, wins.
+// ponytail: one live state per process; key the bridge by session id if OMP ever runs two
+// interactive sessions in one process.
+export function reconcileSharedEntries(entries, sessionId) {
+  const list = Array.isArray(entries) ? entries : [];
+  const shared = bridge();
+  const ownsState = list.some((entry) => entry?.type === "custom" && STATE_ENTRY_TYPES.includes(entry.customType));
+  if (!ownsState && shared.owner && shared.owner !== sessionId) return shared.state;
+  // Ownership is recorded only when the caller can be named: an id-less caller (rtk-session,
+  // caveman-session) folding in the same entries must not hand the live state back to no one.
+  if (sessionId && (ownsState || !shared.owner)) shared.owner = sessionId;
+
   const config = readConfig();
   const modes = { ...config.modes };
   // The ponytail plugin's own default outranks our stored mirror; explicit entries below win over both.
   const pluginDefault = readPonytailPluginDefault();
   if (pluginDefault) modes.ponytail = pluginDefault;
   let preset = null;
-  if (Array.isArray(entries)) {
-    for (const entry of entries) {
+  if (list.length) {
+    for (const entry of list) {
       if (entry?.type !== "custom") continue;
       if (entry.customType === "ts-preset" || entry.customType === "combo-level") {
         const named = presetModes(entry?.data?.preset ?? entry?.data?.level);
@@ -366,7 +440,7 @@ export function reconcileSharedEntries(entries) {
             : entry.customType === "ponytail-mode"
               ? "ponytail"
               : null;
-      if (!KNOBS[name]) continue;
+      if (!owns(KNOBS, name)) continue;
       const raw = entry.customType === "ts-mode" ? entry?.data?.value : entry?.data?.mode ?? entry?.data?.enabled;
       const mode = normalizeMode(name, raw);
       if (!mode) continue;
@@ -383,8 +457,4 @@ export function setSharedListener(listener) {
   return () => {
     if (shared.listener === listener) shared.listener = null;
   };
-}
-
-export function resetSharedState() {
-  return publish(presetModes("off"));
 }
