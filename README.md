@@ -1,15 +1,50 @@
 # oh-my-pi-supreme-token-saver (fork)
 
-A passive Amanai reward detector plus three toggleable [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi) add-ons for terse replies, compact shell output, and minimal code decisions. It also includes combined toggles, health checks, updates, and dry-run support.
+A fork of [`@fernado03/oh-my-pi-supreme-token-saver`](https://www.npmjs.com/package/@fernado03/oh-my-pi-supreme-token-saver)
+for [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi). It ships six presets (`off` → `ultra`) over
+eight knobs — `caveman`, `rtk`, `ponytail`, `read`, `compress`, `prune`, `autoRtk`, `status` — behind one
+command surface (`/token-saver`, alias `/ts`; `/combo` kept as a preset-only alias) and one footer row.
+A preset also drives OMP's **own** native token-economy settings (`read.summarize.*`,
+`shellMinimizer.*`, `compaction.*`, artifact spill, `task.*`, `skillful`) through `omp config`, gated by
+`options.native.mode`. On top of that it adds three prompt-level add-ons — caveman terseness, RTK shell
+guidance, Ponytail code minimalism — and a passive Amanai reward detector that only raises a local notice
+when a completed final response contains a footer-shaped `AMANAI-GACHA-…` key; it never stores, sends, or
+redeems the key. The pack reports no measured saving of its own.
 
-Fork of [`@fernado03/oh-my-pi-supreme-token-saver`](https://www.npmjs.com/package/@fernado03/oh-my-pi-supreme-token-saver) with four behavior changes:
+## What this actually saves — read before installing
 
-| Change | Before | Now |
-|---|---|---|
-| Session default | every mode off until you enable it | a fresh session behaves like `/combo max` (caveman `ultra`, RTK on, ponytail `ultra`); `/combo default <level\|app=mode>` changes what fresh sessions start from, and `/combo off` still opts one session out |
-| Status bar | one footer row per add-on, and the ponytail row used a different marker per mode (`🔥`/`⚡`/`🌿`) | a **single** row for all three: `🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA` — the marker per app is fixed and does not depend on whether the mode came from `/combo`, a per-app command, or the session default |
-| Ponytail config path | installer wrote `~/.config/ponytail/config.json`, which the plugin does not read on Windows | installer writes the path the plugin actually resolves (`$XDG_CONFIG_HOME`, then `%APPDATA%`, then `~/.config`) and sets `hideStatus: true` plus `quietStartup: true`, so the plugin adds neither a second, competing row nor a `Ponytail loaded: <mode>` toast at session start |
-| Startup toasts | every session start raised `RTK loaded: on` and `Caveman loaded: <mode>` on top of the combo row | no add-on announces itself at session start — RTK and Caveman set their state silently, the ponytail plugin runs with `quietStartup: true`, and the combo footer row (`🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA`) is the only status line |
+**The largest lever in an OMP session is not compression, and it is not this pack.** OMP already ships
+structural read summaries (`read.summarize.*`), the shell-output minimizer (`shellMinimizer.*`), artifact
+spill (`tools.artifact*`), and cache-aware pruning of stale reads (`compaction.supersedeReads`,
+`compaction.dropUseless`), all ON by default. Verified against a stock `omp config`:
+`read.summarize.enabled=true`, `shellMinimizer.enabled=true`, `compaction.supersedeReads=true`,
+`compaction.dropUseless=true`. This pack's job is to keep them on and tune their thresholds per preset —
+the `lite` column of the native table below is exactly the stock configuration.
+
+Measured evidence, so you can calibrate expectations:
+
+- **RTK-style shell-command rewriting is not a reliable win.** Independent paired A/B measurement of
+  RTK-style rewriting ([JetBrains, 2026-07](https://blog.jetbrains.com/ai/2026/07/rtk-claude-code-token-savings/))
+  found the bill went **up 7.6%** at low reasoning effort (p=0.004), with turns +13.8% and cache reads
+  +14.3%, and was flat (±0.1%) at high effort — task quality unchanged throughout. RTK's own `rtk gain`
+  reported ~96M tokens saved on that same run. Only ~33% of Bash calls were rewriteable, about 20% of
+  tool-result characters, i.e. roughly **3% of input tokens**.
+- **Caveman-style terseness is the one prompt-level lever with a measured, consistent effect:** −8.5%
+  output tokens in the same benchmark series
+  ([JetBrains, 2026-07](https://blog.jetbrains.com/ai/2026/07/speak-to-ai-agents-like-cavemen-tosave-tokens/)),
+  with quality statistically flat.
+- **Observation masking** — replacing old tool results with placeholders instead of summarizing them —
+  measured ~**−52% cost at quality parity**
+  ([arXiv:2508.21433](https://arxiv.org/abs/2508.21433)). That is why this pack relies on OMP's native
+  `compaction.supersedeReads` / `compaction.dropUseless` rather than shipping its own JS history pruner.
+- **Context rot is real and monotonic in input length**
+  ([Chroma research](https://www.trychroma.com/research/context-rot)), so omission beats summarization:
+  dropping a stale tool result is worth more than restating it.
+
+Conclusion: treat every number this pack prints (including `/rtk gain` and the `👁` meter) as an estimate,
+and measure your own bill with a paired A/B before believing any of it. **Never let `rtk gain` be the
+success metric** — it is the CLI's own self-reported counter and it disagreed with the paired measurement
+above.
 
 ## Install
 
@@ -21,218 +56,272 @@ cd oh-my-pi-supreme-token-saver
 node install-omp-addons.js install --yes
 ```
 
-On Windows, `install.bat` in the clone does the same thing without typing the Node path — double-click it, or run `install.bat` from a shell; with no arguments it runs `node install-omp-addons.js install --yes`, and any arguments are passed straight through (`install.bat --dry-run`, `install.bat doctor`, `install.bat update`).
+Windows: run `install.bat` in the clone — no arguments runs `node install-omp-addons.js install --yes`,
+and any arguments pass straight through (`install.bat --dry-run`, `install.bat doctor`,
+`install.bat update --verbose`).
 
-Without cloning (npm runs the packaged `bin` straight from GitHub; npm 11+ needs `--allow-git=all` for git sources):
+Without cloning:
 
 ```bash
 npx --yes --allow-git=all github:dillydalli3r/oh-my-pi-supreme-token-saver install --yes
 ```
 
-The installer copies the bundled extensions into `~/.omp/agent/extensions`, registers them in `~/.omp/agent/config.yml`, installs the Ponytail plugin (`github:DietrichGebert/ponytail`) and the RTK binary, and pins the Ponytail defaults above. `--dry-run` previews every write; `doctor` verifies the result afterwards.
+`--preset <name>` seeds `~/.omp/agent/token-saver.json` **only when that file does not exist yet**;
+`--force-preset` lets `--preset` overwrite an existing one.
 
-**After install:** restart OMP. New sessions start at `max`; `/combo medium`, `/combo off`, or the individual toggles change it per session, and `/combo default <level>` changes what fresh sessions start from.
+**After install: restart OMP.** The installer copies the extensions into `~/.omp/agent/extensions`,
+registers them in `~/.omp/agent/config.yml`, installs the Ponytail plugin and the RTK binary, and writes
+`hideStatus=true` / `quietStartup=true` to the Ponytail plugin config so only the pack's own row shows.
+The installer never writes OMP's native settings — that layer is opt-in (see
+[Native settings](#native-settings)).
 
-Individual toggles: `/caveman ultra` · `/rtk on` · `/ponytail ultra`
+## Presets
 
-`update` runs the latest installer: the npm package when this fork is published (`npm login` then `npm publish --access public`), otherwise the GitHub source automatically — the same source the install command above uses. `reinstall` rebuilds from the local checkout instead.
+Exactly the table in `PRESETS` (`extensions/shared/session-state.js`). Every preset sets every knob, so a
+state either matches a preset or reports as `custom`.
 
-## What it installs
+| Knob | off | lite | medium | high | max | ultra |
+|---|---|---|---|---|---|---|
+| `caveman` | off | lite | full | ultra | ultra | ultra |
+| `rtk` | off | on | on | on | on | on |
+| `ponytail` | off | lite | full | full | ultra | ultra |
+| `read` | off | off | lite | full | full | full |
+| `compress` | off | lite | full | full | full | ultra |
+| `prune` | off | off | off | lite | full | ultra |
+| `autoRtk` | off | on | on | on | on | on |
+| `status` | full | full | full | full | full | compact |
 
-| Add-on | What it does |
+Accepted values per knob: `caveman` `off|lite|full|ultra|wenyan` · `rtk` `off|on` · `ponytail`
+`off|lite|full|ultra` · `read` `off|lite|full` · `compress` `off|lite|full|ultra` · `prune`
+`off|lite|full|ultra` · `autoRtk` `off|on` · `status` `off|compact|full`.
+
+The stored default for new sessions is `max` until changed with `/ts default <preset>`.
+
+## Commands
+
+One surface. `/token-saver` and `/ts` are identical; `/combo` accepts preset names only and rejects the
+other verbs.
+
+| Command | Effect |
 |---|---|
-| **Caveman** | Shortens replies while retaining technical substance. Modes: `lite`, `full`, `ultra`, and `wenyan` |
-| **RTK** | Routes noisy shell commands through the RTK binary for compact output |
-| **Ponytail** | Favors standard-library, minimal, YAGNI-oriented code decisions |
-| **Updater** | Checks and updates Ponytail, RTK, and Caveman in-session, with dry-run and backup support |
-| **Combo** | Switches Caveman, RTK, and Ponytail together. Presets: `off`, `medium`, and `max`; mixed individual modes display as `custom` |
-| **Amanai reward detector** | Locally notifies you when a final successful response contains a footer-shaped `AMANAI-GACHA-…` key; it never changes output, stores or sends the key, redeems it, opens a browser, or creates requests |
+| `/ts` or `/ts status` | Preset, every knob, context meter, config path, native gate, stored default |
+| `/ts <preset>` or `/ts preset <preset>` | Apply a preset to this session (also `/combo <preset>`) |
+| `/ts set <knob>=<value> …` | Set one or more knobs for this session; all pairs validated before any is written |
+| `/ts default` | Show what new sessions start from |
+| `/ts default <preset>` | Store a preset as the default for new sessions |
+| `/ts default <knob>=<value> …` | Store a partial override (displays as `custom`) |
+| `/ts default reset` | Delete the config file; back to built-in `max` |
+| `/ts option <group>.<key>=<value>` | Set a behaviour option (`compress.*`, `prune.*`, `read.*`, `autoRtk.*`, `status.*`, `native.mode`) |
+| `/ts native [status\|on\|off\|apply\|reset]` | Inspect/apply OMP's own settings; `on` is an alias for `auto` |
+| `/ts help` | Usage, knob list, option list |
 
-All three token-saving modes start at `max` (the session default); `/combo default <level>` changes what fresh sessions start from, and `/combo off` disables them for the current session.
+Applying a preset or `set` persists session entries and reloads the session.
 
-For long sessions, the package reasserts active modes after Ponytail's prompt block on every top-level turn, including after OMP compacts earlier history.
+Individual add-ons:
 
-### Amanai reward detector
+```text
+/caveman [lite|full|ultra|wenyan|off|status]   bare = full
+/rtk [on|off|status|gain]                      gain prints RTK's self-reported counters
+/rtk auto [on|off|status]                      automatic rewrite of eligible bash commands
+/ponytail [lite|full|ultra|off|status]         provided by the Ponytail plugin, not by this repo
+/ai-addons <check|status>                      version check for ponytail / rtk / caveman / tokensaver
+/ai-addons update <ponytail|rtk|caveman|tokensaver|all> [--dry-run]
+```
 
-The detector only scans the completed final assistant response, then shows a local notice. Redeem any detected key yourself in the Amanai billing dashboard; the extension does not retain or expose it.
+Natural-language off switch for caveman: a bare input of `caveman off`, `stop caveman`, or `normal mode`
+sets it back to `off` for the session.
 
-The package also declares a Pi-native adapter through `pi.extensions`. It waits for Pi's final settled response before issuing the same local notice; the OMP installer installs only the OMP adapter.
+## Native settings
 
-## CLI
+`omp config` is the only writer of `~/.omp/agent/config.yml` (path confirmed via `omp config path`).
+When a preset is applied, the pack writes the keys below **only if `options.native.mode` is `auto`**.
+The default is `off`: presets then never touch your OMP config, and `/ts native apply` is the only way to
+write it.
 
-After the global install, use these short commands for routine maintenance:
+| Key | lite | medium | high | max | ultra | What it is |
+|---|---|---|---|---|---|---|
+| `read.summarize.enabled` | true | true | true | true | true | Structural code summaries for selector-less reads |
+| `read.summarize.prose` | false | false | false | true | true | Structural summaries for Markdown/plain-text reads |
+| `read.summarize.minTotalLines` | 100 | 100 | 80 | 60 | 40 | Files shorter than this are read verbatim instead of summarized |
+| `read.summarize.unfoldLimit` | 100 | 100 | 80 | 60 | 40 | Ceiling on summary size while BFS-unfolding; larger spans stay folded |
+| `read.defaultLimit` | 300 | 300 | 200 | 200 | 200 | Default line count for a read with no limit |
+| `shellMinimizer.enabled` | true | true | true | true | true | Compress verbose shell output (git, npm, cargo, …) before returning it |
+| `shellMinimizer.sourceOutlineLevel` | default | default | default | default | aggressive | Source outline mode for `cat`/`read` of source files |
+| `tools.artifactSpillThreshold` | 50 | 50 | 30 | 20 | 10 | Tool output above this size spills to an artifact, tail kept inline |
+| `tools.artifactTailBytes` | 20 | 20 | 16 | 12 | 8 | Tail content kept inline when output spills |
+| `tools.artifactHeadBytes` | 20 | 20 | 16 | 12 | 0 | Head kept inline alongside the tail; `0` = tail only |
+| `tools.artifactTailLines` | 500 | 500 | 400 | 300 | 200 | Maximum tail lines kept inline when output spills |
+| `tools.intentTracing` | true | true | false | false | false | Ask the agent to describe each tool call's intent before executing it |
+| `compaction.supersedeReads` | true | true | true | true | true | Prune older read results when the same file is read again (cache-aware) |
+| `compaction.dropUseless` | true | true | true | true | true | Prune tool results flagged contextually useless (no matches, timed-out waits) |
+| `compaction.keepRecentTokens` | 20000 | 20000 | 16000 | 12000 | 8000 | Verbatim-history floor left after a compaction |
+| `compaction.idleEnabled` | false | false | false | true | true | Compact while idle when the token count exceeds threshold |
+| `task.maxEffort` | max | max | high | high | medium | Ceiling on the `task` tool's per-spawn reasoning effort |
+| `task.softRequestBudget` | 200 | 200 | 200 | 150 | 90 | Soft request budget per subagent; 1.5× force-stops the run |
+| `skillful` | true | true | true | true | false | List available skills in the system prompt |
 
-| Command | Purpose |
+Notes that matter:
+
+- `lite` is exactly the OMP stock configuration across all 19 keys, so `/ts native apply` under `lite`
+  writes nothing. `medium` and above are where thresholds actually move.
+- Two defaults are inverted and worth knowing: **`tools.intentTracing` defaults ON** and adds an intent
+  string to every tool call — only `high` and above turn it off. **`skillful` defaults ON** and ships the
+  skill inventory in the system prompt — only `ultra` drops it, and that is a real functionality tradeoff.
+- Preset `off` writes no anti-defaults: `/ts native reset` (and any `off`-preset native apply) resets
+  exactly these 19 keys to whatever OMP then considers sane, which is more durable than pinning `false`.
+- Deliberately untouched: `provider.appendOnlyContext`, `memory.backend`, `advisor`/`autolearn`/`prewalk`,
+  `snapcompact`, and every display/statusLine/tui key — display keys cost no model tokens.
+- `/ts native reset` runs one `omp` process per key (19). A missing `omp` CLI degrades to a warning
+  (`Native settings unavailable: … config.yml untouched.`); the preset itself still applies.
+
+## Configuration file
+
+`~/.omp/agent/token-saver.json`. Only keys that were set appear; the installer seeds the minimal form:
+
+```json
+{
+  "version": 2,
+  "preset": "max",
+  "modes": { "caveman": "ultra", "rtk": "on" },
+  "options": {
+    "compress": { "maxLines": 600, "maxBytes": 32768, "keepHead": 300, "keepTail": 150, "minBytes": 2048, "stripAnsi": true, "dedupe": true },
+    "prune": { "keepRecentToolResults": 24, "maxOlderResultBytes": 4096, "dedupeReads": true, "preserveErrors": true },
+    "read": { "skeletonOverBytes": 2048 },
+    "autoRtk": { "timeoutMs": 2000, "exclude": [] },
+    "status": { "showMeter": true, "showSavings": true },
+    "native": { "mode": "off" }
+  }
+}
+```
+
+- `preset` replaces every mode; `modes` are per-knob overrides that win over the preset for the keys they
+  set, so a partial config stays a partial override.
+- `/ts default <preset|knob=value|reset>` writes `preset`/`modes`. It changes what **new** sessions start
+  from; the running session is untouched.
+- `/ts option <group>.<key>=<value>` writes `options.<group>.<key>`. Options describe behaviour (sizes,
+  timeouts, dedupe flags), not intensity, so they apply to new sessions rather than the current one.
+- Choosing a ponytail default also pushes it into the Ponytail plugin's own config, and reports
+  `[pending] Ponytail plugin not found` when that write fails.
+- Legacy migration: if `token-saver.json` is absent, the pre-2.0 `~/.omp/agent/combo-defaults.json`
+  (bare `caveman`/`rtk`/`ponytail` keys) is read once so an upgrade keeps your level. The next write goes
+  to `token-saver.json` and deletes the legacy file.
+
+Environment overrides:
+
+| Variable | Overrides |
 |---|---|
-| `oh-my-pi-supreme-token-saver install` | Install non-interactively to user scope by default; use `--scope project` or `--scope both` for another scope |
-| `oh-my-pi-supreme-token-saver update` | Run the latest installer — the npm package when published, otherwise the GitHub source |
-| `oh-my-pi-supreme-token-saver reinstall` | Remove the bundled extension directories and RTK binary, then install fresh at user scope; the separate Ponytail package is preserved and refreshed |
-| `oh-my-pi-supreme-token-saver doctor` | Check OMP, extension, Ponytail, and RTK installation health |
-| `oh-my-pi-supreme-token-saver uninstall` | Remove bundled extensions; add `--remove-rtk` to remove the RTK binary or `--remove-ponytail` to unregister Ponytail's extension path (the Ponytail package remains installed) |
-| `oh-my-pi-supreme-token-saver version` | Print the package version (`--version` or `-v` also works) |
-| `oh-my-pi-supreme-token-saver help` | Show usage (`--help` or `-h` also works) |
+| `OMP_TOKEN_SAVER_CONFIG` | Path of `token-saver.json` |
+| `OMP_COMBO_DEFAULTS_FILE` | Path of the legacy `combo-defaults.json` |
+| `OMP_PONYTAIL_PACKAGE_DIR` | Location of the Ponytail plugin package (default reading/writing of its `defaultMode`) |
 
-Useful flags are `--scope user|project|both`, `--dry-run`, `--yes`/`-y`, and `--verbose`. The original no-subcommand install and legacy `--doctor` and `--uninstall` forms remain supported.
+## Status row
 
-## Commands reference
-
-### Caveman — terse replies
+`extensions/shared/status-line.js` is the **only** module that writes the `modes` status key, so a knob's
+symbol never depends on how the value was set (`/ts`, a per-app command, or the stored default). One row,
+full form:
 
 ```text
-/caveman lite         concise, drops pleasantries
-/caveman full         terse caveman style
-/caveman ultra        maximum terse, fragments only
-/caveman wenyan       classical-Chinese-style where clear
-/caveman off          normal mode
-/caveman status       show current mode
+🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: FULL · 🔁 auto: ON · 👁 42% ctx
 ```
 
-Natural-language off switches also work: `caveman off`, `stop caveman`, and `normal mode`.
-
-### RTK — compact shell output
+Compact form (`preset ultra`, or `status compact`):
 
 ```text
-/rtk on               enable compact RTK output
-/rtk off              disable
-/rtk status           show current state
+🧩 ULTRA · 🦴U · 🦀ON · 🐴U · 📖F · 🗜️U · 🧹U · 🔁ON · 👁42%
 ```
 
-When enabled, the agent prefers RTK for noisy commands such as:
-
-```text
-rtk git status
-rtk git diff
-rtk read src/index.ts
-rtk grep "pattern" src
-rtk test bun test
-rtk tsc
-rtk lint
-```
-
-### Ponytail — minimal code
-
-```text
-/ponytail lite        light guidance
-/ponytail full        full YAGNI enforcement
-/ponytail ultra       aggressive simplification
-/ponytail off         disable
-/ponytail status      show current state
-```
-
-### Updater — check and update add-ons
-
-```text
-/ai-addons check                          check all add-on versions
-/ai-addons status                         same as check
-/ai-addons update ponytail                update Ponytail
-/ai-addons update rtk                     update the RTK binary
-/ai-addons update caveman                 update the Caveman rule
-/ai-addons update all                     update all three
-/ai-addons update all --dry-run           preview without changes
-```
-
-### Combo — toggle all three
-
-```text
-/combo off                          all three off for this session
-/combo medium                       caveman=lite, rtk=on, ponytail=lite
-/combo max                          caveman=ultra, rtk=on, ponytail=ultra
-/combo status                       show the level, the underlying modes, and the default
-/combo help                         show available levels
-/combo default                      show the level fresh sessions start from
-/combo default off|medium|max       set what fresh sessions start from
-/combo default caveman=lite rtk=off ponytail=full
-/combo default reset                 drop the override (back to max)
-```
-
-`/combo` persists each add-on's state and reloads OMP so the new modes apply immediately, without emitting separate `/caveman`, `/rtk`, or `/ponytail` command messages.
-
-Active Combo presets are inherited by OMP task subagents created from the session. `/combo medium` or `/combo max` is the only way to activate a preset and show the Combo footer indicator. Individual `/caveman`, `/rtk`, and `/ponytail` commands leave Combo inactive; `/combo status` reports their actual mixed state without turning the indicator on.
-
-### Combo defaults — what a fresh session starts from
-
-Every session that has no combo entry yet starts from the stored defaults: built-in `max` until you change them.
-
-- `/combo default <level>` writes the preset; `/combo default caveman=lite rtk=off ponytail=full` pins single apps and displays as `custom`. Unpinned apps keep their built-in default.
-- The running session is never changed by `default` — `/combo off|medium|max` applies a level now.
-- Defaults persist in `~/.omp/agent/combo-defaults.json` (override the path with `OMP_COMBO_DEFAULTS_FILE`). Only keys you set are written, so a caveman-only default never pins ponytail.
-- Ponytail keeps its own default: `/combo default` also calls the plugin's `writeDefaultMode`, and `PONYTAIL_DEFAULT_MODE` still outranks it. `/ponytail status` shows `current <mode> • default <mode>`, and `/combo default` reports the value that actually runs.
-- `ponytail=review` is refused: review is session-only upstream. `/combo default reset` clears the file and returns ponytail to `ultra`.
-- `install` fills ponytail's `defaultMode` only when nothing has set one, so reinstalling does not undo a default you chose in-session.
+- The meter (`👁 NN% ctx`) is appended only when context usage is known; the usage value is published once
+  per `turn_end`/`message_end` and read back from shared state.
+- `status off` removes the row entirely (the key is deleted, not blanked).
+- Rendering is display-only: nothing in the status module changes a mode.
 
 ## File locations
 
 | What | Path |
 |---|---|
+| Token Saver extension (commands, presets, native driver) | `~/.omp/agent/extensions/token-saver/` |
+| Shared modules (`session-state.js`, `status-line.js`, `mode-reinforcement.js`) | `~/.omp/agent/extensions/shared/` |
 | Caveman extension | `~/.omp/agent/extensions/caveman-session/` |
 | RTK extension | `~/.omp/agent/extensions/rtk-session/` |
-| Ponytail package | `~/.omp/plugins/node_modules/@dietrichgebert/ponytail/` |
-| Updater extension | `~/.omp/agent/extensions/ai-addons-updater/` |
-| Combo extension | `~/.omp/agent/extensions/combo-toggle/` |
-| Amanai detector extension | `~/.omp/agent/extensions/amanai-reward/` |
+| Updater extension (`/ai-addons`) | `~/.omp/agent/extensions/ai-addons-updater/` |
+| Amanai reward detector | `~/.omp/agent/extensions/amanai-reward/` |
+| Ponytail plugin | `~/.omp/plugins/node_modules/@dietrichgebert/ponytail/` |
+| Ponytail plugin config (`defaultMode`, `hideStatus`, `quietStartup`) | `$XDG_CONFIG_HOME/ponytail/config.json`, else `%APPDATA%\ponytail\config.json`, else `~/.config/ponytail/config.json` |
 | RTK binary | `~/.bun/bin/rtk` (`rtk.exe` on Windows) |
-| Combo session defaults | `~/.omp/agent/combo-defaults.json` |
-| Explicit extension registrations | `~/.omp/agent/config.yml` |
+| Session defaults | `~/.omp/agent/token-saver.json` |
+| Legacy pre-2.0 defaults (read once, deleted on first write) | `~/.omp/agent/combo-defaults.json` |
+| OMP native settings and extension registrations | `~/.omp/agent/config.yml` |
+| Project scope install target | `./.omp/extensions` |
 
-## Backups
-
-Before replacing an existing extension source file, the installer writes `<file>.bak`. The in-session updater also creates:
-
-- RTK binary: `rtk.bak` or `rtk.exe.bak`, restored if the new binary fails validation
-- Caveman rule: `rule.md.bak`, restored if the written hash is invalid
-
-## Prerequisites
-
-- [OMP (Oh My Pi)](https://github.com/can1357/oh-my-pi)
-- Node.js 18+ with npm
-
-The installer and `/ai-addons update all` create `~/.bun/bin` for RTK compatibility even when Bun is not installed.
-
-### WSL
-
-Windows and WSL have separate OMP homes. When installing for OMP inside WSL, run the install from WSL and check:
-
-```bash
-command -v npm
-```
-
-It must resolve to a Linux path such as `~/.nvm/versions/node/.../bin/npm`, not a Windows path under `/mnt/c/`; otherwise the add-ons may be installed into the Windows environment instead of the WSL OMP home.
-
-## Advanced: one-off use
-
-Without keeping the package globally installed, run the latest commit once:
-
-```bash
-npx --yes --allow-git=all github:dillydalli3r/oh-my-pi-supreme-token-saver install --yes
-```
-
-Once the fork is published to npm, the registry form works too:
-
-```bash
-npm exec --yes --prefer-online --package=@dillydalli3r/oh-my-pi-supreme-token-saver@latest -- oh-my-pi-supreme-token-saver install
-```
+Pre-2.0 shipped a separate `combo-toggle` extension directory. 2.0 has no such directory: `/combo` is
+registered by `token-saver`.
 
 ## Troubleshooting
 
-### Ponytail or Combo command is missing
+### `/combo` is missing after upgrading
 
-Run `oh-my-pi-supreme-token-saver reinstall` in the same Windows, WSL, or Linux environment where OMP runs, restart OMP, then try `/ponytail status` and `/combo status`. If either is still missing, run `oh-my-pi-supreme-token-saver doctor`; the installer normally repairs both explicit registrations in `~/.omp/agent/config.yml`.
+A pre-2.0 install left `~/.omp/agent/extensions/combo-toggle/` and its `config.yml` entries behind, and
+OMP would load that duplicate instead of the 2.0 surface. Fix by reinstalling — the installer removes the
+stale directory and its `config.yml` lines:
 
-### A combo default does not apply to a new session
+```bash
+oh-my-pi-supreme-token-saver reinstall
+```
 
-Run `/combo default` to see the stored default and its file path, then `/combo status` in the new session. A session that already has a combo entry keeps its own level — only sessions with no entry start from the default. If ponytail's mode still differs from the reported default, `PONYTAIL_DEFAULT_MODE` is set in the environment and outranks the config file; `/ponytail status` shows both values.
+`oh-my-pi-supreme-token-saver doctor` reports it either way:
+`combo-toggle (pre-2.0): STALE <path>` plus `[warn] config.yml still lists combo-toggle — rerun: install --yes`.
 
 ### RTK is missing or not executable
 
-Run `oh-my-pi-supreme-token-saver reinstall`, then `oh-my-pi-supreme-token-saver doctor`. On Linux or macOS, an older manually installed binary can be repaired with:
+`oh-my-pi-supreme-token-saver reinstall`, then `doctor`. On Linux/macOS a hand-installed binary can be
+repaired with `chmod +x ~/.bun/bin/rtk`. `/rtk status` shows the toggle; a failed spawn or timeout leaves
+the command unchanged rather than failing the tool call. Remember the A/B result above before enabling
+`autoRtk` for the sake of savings.
 
-```bash
-chmod +x ~/.bun/bin/rtk
-```
+### Ponytail default drifts from the reported default
 
-### Checksum warning or failure
+The Ponytail plugin owns its own default. `/ts default <preset>` pushes it via the plugin's
+`writeDefaultMode`, but `PONYTAIL_DEFAULT_MODE` in the environment outranks the config file. Locate the
+plugin with `OMP_PONYTAIL_PACKAGE_DIR` if it is installed somewhere non-standard, and check both values
+with `/ponytail status` (it prints `current <mode> • default <mode>`).
 
-The installer verifies RTK against `checksums.txt` when checksum metadata is available and aborts on a mismatch. If the checksum file or matching asset entry is unavailable, installation warns and continues; `/ai-addons update rtk` is stricter and aborts when checksum metadata is missing.
+### `omp config` unavailable
+
+The native layer is optional. With no `omp` CLI on the path, `/ts native …` and preset-time native writes
+report `Native settings unavailable: … config.yml untouched.` as a warning — the preset still applies and
+no OMP file is modified. Everything else in the pack is unaffected.
+
+### WSL
+
+Windows and WSL have separate OMP homes. Run the install from inside WSL and check `command -v npm`: it
+must resolve to a Linux path such as `~/.nvm/versions/node/.../bin/npm`, not a Windows path under
+`/mnt/c/`, or the add-ons land in the Windows OMP home instead.
+
+## CLI
+
+Entry point: `oh-my-pi-supreme-token-saver` (`install-omp-addons.js`).
+
+| Command | Purpose |
+|---|---|
+| `install` | Install the add-ons; user scope by default |
+| `update` | Run the latest installer — npm package first, GitHub source as fallback |
+| `reinstall` | Clean and reinstall the user-scope add-ons |
+| `doctor` | Check OMP, extension, Ponytail, and RTK health (including the stale `combo-toggle` check) |
+| `uninstall` | Remove the managed extensions |
+| `version` | Print the package version |
+| `help` | Print usage |
+
+| Flag | Effect |
+|---|---|
+| `--scope user\|project\|both` | Install scope (default `user`; accepts `--scope=user` too) |
+| `--preset <off\|lite\|medium\|high\|max\|ultra>` | Seed the default preset, only when `token-saver.json` is absent |
+| `--force-preset` | Let `--preset` overwrite an existing `token-saver.json` |
+| `--remove-ponytail` | Uninstall: also drop the Ponytail plugin entry from `config.yml` |
+| `--remove-rtk` | Uninstall: also delete the RTK binary |
+| `--yes`, `-y` | Non-interactive |
+| `--dry-run` | Preview writes; nothing touches disk |
+| `--verbose` | Debug output |
+| `--version`, `-v` / `--help`, `-h` | Same as `version` / `help` |
 
 ## License
 

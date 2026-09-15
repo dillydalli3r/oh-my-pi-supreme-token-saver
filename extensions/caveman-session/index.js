@@ -1,7 +1,14 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { getSharedComboState, isOmpSubagentPrompt, readComboDefaults, setSharedComboMode } from "../shared/session-state.js";
+import {
+  getSharedState,
+  isOmpSubagentPrompt,
+  normalizeMode,
+  readDefaultModes,
+  reconcileSharedEntries,
+  setSharedMode,
+} from "../shared/session-state.js";
 
 const CAVERN_DIR = dirname(fileURLToPath(import.meta.url));
 const RULE_PATH = join(CAVERN_DIR, "rule.md");
@@ -22,8 +29,6 @@ function readFullRule() {
   try { return readFileSync(RULE_PATH, "utf8"); } catch { return FALLBACK_FULL_RULE; }
 }
 
-const MODES = new Set(["off", "lite", "full", "ultra", "wenyan"]);
-
 const INSTRUCTIONS = {
   lite: `Caveman lite active for this session.
 Respond concise. Drop pleasantries, filler, and hedging. Keep complete technical substance. Code, commands, paths, errors, commits, and PR text stay normal/exact.`,
@@ -34,20 +39,17 @@ Maximum terse prose. Fragments preferred. No pleasantries, no tour, no recap unl
 Use ultra-terse classical-Chinese-style prose only where it preserves clarity for the user. Keep technical terms, code, commands, commits, PR text, paths, and errors exact. If clarity would suffer, use caveman full instead.`,
 };
 
-function normalizeMode(value) {
-  const mode = String(value || "").trim().toLowerCase();
-  return MODES.has(mode) ? mode : null;
+function normalize(value) {
+  return normalizeMode("caveman", value);
 }
 
-function resolveMode(entries, fallback = readComboDefaults().caveman) {
-  if (!Array.isArray(entries)) return fallback;
-  for (let i = entries.length - 1; i >= 0; i -= 1) {
-    const entry = entries[i];
-    if (entry?.type !== "custom" || entry?.customType !== "caveman-mode") continue;
-    const mode = normalizeMode(entry?.data?.mode);
-    if (mode) return mode;
-  }
-  return fallback;
+function defaultMode() {
+  return normalize(readDefaultModes().caveman) || "off";
+}
+
+function instructionFor(mode) {
+  const block = INSTRUCTIONS[mode];
+  return typeof block === "function" ? block() : block;
 }
 
 function isOffCommand(text) {
@@ -56,14 +58,14 @@ function isOffCommand(text) {
 }
 
 export default function cavemanSessionExtension(pi) {
-  let currentMode = readComboDefaults().caveman;
+  let currentMode = defaultMode();
 
   function setMode(mode, ctx) {
-    const normalized = normalizeMode(mode);
+    const normalized = normalize(mode);
     if (!normalized) return false;
     currentMode = normalized;
     pi.appendEntry("caveman-mode", { mode: normalized });
-    setSharedComboMode("caveman", normalized);
+    setSharedMode("caveman", normalized);
     ctx?.ui?.notify?.(`Caveman mode ${normalized === "off" ? "off" : `set to ${normalized}`}.`, "info");
     return true;
   }
@@ -79,7 +81,9 @@ export default function cavemanSessionExtension(pi) {
         return;
       }
       if (arg === "status") {
-        ctx?.ui?.notify?.(`Caveman: ${currentMode}`, "info");
+        const fallback = defaultMode();
+        const suffix = fallback === currentMode ? "" : ` · default ${fallback}`;
+        ctx?.ui?.notify?.(`Caveman: ${currentMode}${suffix}`, "info");
         return;
       }
       if (!setMode(arg, ctx)) {
@@ -93,12 +97,12 @@ export default function cavemanSessionExtension(pi) {
     if (currentMode !== "off" && isOffCommand(event?.text)) setMode("off");
   });
 
+  // No startup notify: the footer row reports caveman:<MODE>.
   function restoreMode(ctx) {
     const entries = ctx?.sessionManager?.getBranch?.() || ctx?.sessionManager?.getEntries?.() || [];
-    currentMode = resolveMode(entries);
+    currentMode = normalize(reconcileSharedEntries(entries).caveman) || defaultMode();
   }
 
-  // No startup notify: the combo footer row already reports caveman: ULTRA|OFF.
   pi.on("session_start", async (_event, ctx) => {
     restoreMode(ctx);
   });
@@ -111,15 +115,16 @@ export default function cavemanSessionExtension(pi) {
     restoreMode(ctx);
   });
 
-  pi.on("agent_start", async (_event) => {
-    setSharedComboMode("caveman", currentMode);
+  pi.on("agent_start", async () => {
+    setSharedMode("caveman", currentMode);
   });
 
   pi.on("before_agent_start", async (event) => {
-    const mode = isOmpSubagentPrompt(event.systemPrompt) ? getSharedComboState().caveman : currentMode;
+    const mode = isOmpSubagentPrompt(event.systemPrompt) ? getSharedState().caveman : currentMode;
     if (!mode || mode === "off") return;
-    const instruction = typeof INSTRUCTIONS[mode] === "function" ? INSTRUCTIONS[mode]() : INSTRUCTIONS[mode];
+    const instruction = instructionFor(mode);
     const base = Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt];
+    if (base.some((prompt) => typeof prompt === "string" && prompt.includes(instruction))) return;
     return { systemPrompt: [...base, instruction] };
   });
 }

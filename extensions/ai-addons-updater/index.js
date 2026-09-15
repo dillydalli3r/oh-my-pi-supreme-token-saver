@@ -1,8 +1,9 @@
-// OMP extension: /ai-addons manual updater for Ponytail, RTK, Caveman.
+// OMP extension: /ai-addons manual updater for Ponytail, RTK, Caveman, Token Saver.
 // Built-in Node modules only. Default off; registers a single slash command.
 // ponytail: `skipped: none` — semantics match one-liner: fetch + compare + run install.
 // rtk: `skipped: signature verification` — checksums.txt ships only SHA256 of release assets; add sigchain when upstream publishes a signing key.
 // caveman: `skipped: none` — exactly the ask: write rule.md, report old/new hash.
+// tokensaver: `skipped: direct writes` — the pack owns its own installer, we only spawn it.
 
 import https from "node:https";
 import { createHash } from "node:crypto";
@@ -15,12 +16,25 @@ import { execFileSync } from "node:child_process";
 const IS_WINDOWS = process.platform === "win32";
 const HOME = os.homedir();
 
+// Installed layout (v2): each extension is a directory under ~/.omp/agent/extensions
+// (caveman-session, rtk-session, token-saver, ai-addons-updater), shared modules live in
+// extensions/shared (session-state.js, status-line.js, mode-reinforcement.js). This updater never
+// writes inside them — the pack's own installer owns that.
+const EXTENSIONS_DIR = path.join(HOME, ".omp", "agent", "extensions");
+
 const PONYTAIL_REMOTE = "https://raw.githubusercontent.com/DietrichGebert/ponytail/main/package.json";
 const PONYTAIL_LOCAL = path.join(HOME, ".omp", "plugins", "node_modules", "@dietrichgebert", "ponytail", "package.json");
 const RTK_RELEASE_API = "https://api.github.com/repos/rtk-ai/rtk/releases/latest";
 const RTK_BINARY = path.join(HOME, ".bun", "bin", IS_WINDOWS ? "rtk.exe" : "rtk");
 const CAVEMAN_REMOTE = "https://raw.githubusercontent.com/JuliusBrussee/caveman/main/src/rules/caveman-activate.md";
-const CAVEMAN_LOCAL = path.join(HOME, ".omp", "agent", "extensions", "caveman-session", "rule.md");
+const CAVEMAN_LOCAL = path.join(EXTENSIONS_DIR, "caveman-session", "rule.md");
+
+const TS_CONFIG = path.join(HOME, ".omp", "agent", "token-saver.json");
+const TS_INDEX = path.join(EXTENSIONS_DIR, "token-saver", "index.js");
+const TS_PACKAGE_VERSION = path.join(EXTENSIONS_DIR, "package-version");
+const TS_COMMITS_API = "https://api.github.com/repos/dillydalli3r/oh-my-pi-supreme-token-saver/commits?per_page=1";
+const TS_GIT_SOURCE = "github:dillydalli3r/oh-my-pi-supreme-token-saver";
+const TS_NPM_SPEC = "@dillydalli3r/oh-my-pi-supreme-token-saver@latest";
 
 const RELOAD_MSG = "Reminder: restart OMP (or reload extensions) for updates to take effect.";
 
@@ -90,6 +104,36 @@ function notify(ctx, msg, level) {
   ctx?.ui?.notify?.(String(msg), level || "info");
 }
 
+// The pack ships no version into the installed tree, so the row guesses from the index.js mtime.
+// Local-vs-remote dates are only a hint: this repo publishes straight from GitHub, so a date gap
+// signals probable staleness, not proof — run `/ai-addons update tokensaver` to be sure.
+async function checkTokenSaver() {
+  let localDate = null;
+  try {
+    localDate = new Date((await fs.stat(TS_INDEX)).mtime).toISOString().slice(0, 10);
+  } catch { localDate = null; }
+
+  let preset = null;
+  const configRaw = await readTextIfExists(TS_CONFIG);
+  if (configRaw) {
+    try { preset = JSON.parse(configRaw).preset || null; } catch { preset = null; }
+  }
+
+  const versionRaw = await readTextIfExists(TS_PACKAGE_VERSION);
+  const installed = versionRaw ? versionRaw.split(/\r?\n/)[0].trim() || null : null;
+
+  let remoteDate = null;
+  let remoteError = null;
+  try {
+    const raw = await httpsGet(TS_COMMITS_API);
+    remoteDate = JSON.parse(raw)?.[0]?.commit?.committer?.date?.slice(0, 10) || null;
+  } catch (e) { remoteError = e.message; }
+
+  const suffix = `${preset ? ` preset=${preset}` : ""}${installed ? ` installed=${installed}` : ""}`;
+  const row = `Token saver (estimate): local ${localDate || "—"} · remote ${remoteDate || "—"}${suffix}`;
+  return { row, remoteError };
+}
+
 // Check: no mutation.
 async function checkAddons(ctx) {
   const lines = [];
@@ -144,6 +188,16 @@ async function checkAddons(ctx) {
     lines.push(m); notify(ctx, m, "info");
   } catch (e) {
     const m = `Caveman check failed: ${e.message}`;
+    lines.push(m); notify(ctx, m, "warning");
+  }
+
+  // Token Saver pack (local date is an mtime guess; see note above)
+  try {
+    const { row, remoteError } = await checkTokenSaver();
+    lines.push(row);
+    notify(ctx, remoteError ? `${row} (remote lookup failed: ${remoteError})` : row, remoteError ? "warning" : "info");
+  } catch (e) {
+    const m = `Token saver check failed: ${e.message}`;
     lines.push(m); notify(ctx, m, "warning");
   }
 
@@ -384,11 +438,47 @@ async function updateCaveman(ctx, dryRun = false) {
   }
 }
 
+// Same path the installer uses: npx runs the pack's own `update`. GitHub source first (the fork
+// publishes from there), npm package as the fallback once it is published. Writes never happen here
+// — the installer owns ~/.omp/agent/extensions/token-saver/.
+function tokenSaverSources() {
+  return [
+    { label: TS_GIT_SOURCE, args: ["--yes", "--allow-git=all", TS_GIT_SOURCE, "update", "--yes"] },
+    { label: TS_NPM_SPEC, args: ["--yes", TS_NPM_SPEC, "update", "--yes"] },
+  ];
+}
+
+async function updateTokenSaver(pi, ctx, dryRun = false) {
+  const sources = tokenSaverSources();
+  if (dryRun) {
+    const m = `Token saver dry-run: would run \`npx ${sources[0].args.join(" ")}\`, falling back to \`npx ${sources[1].args.join(" ")}\`.`;
+    notify(ctx, m, "info");
+    return m;
+  }
+  const failures = [];
+  for (const source of sources) {
+    notify(ctx, `Token saver: running npx ${source.label} update…`, "info");
+    try {
+      const r = await pi.exec("npx", source.args);
+      const out = [r.stdout, r.stderr].filter(Boolean).join("\n").trim();
+      if (r.code !== 0) throw new Error(r.stderr || `npx exited ${r.code}`);
+      const m = `Token saver updated via ${source.label}.${out ? `\n${out}` : ""}\n${RELOAD_MSG}`;
+      notify(ctx, "Token saver update finished. " + RELOAD_MSG, "info");
+      return m;
+    } catch (e) {
+      failures.push(`${source.label}: ${e.message}`);
+    }
+  }
+  const m = `Token saver update failed:\n${failures.join("\n")}`;
+  notify(ctx, m, "warning");
+  return m;
+}
+
 export default function aiAddonsUpdaterExtension(pi) {
   pi.setLabel?.("AI add-ons updater");
 
   pi.registerCommand("ai-addons", {
-    description: "Check or update AI add-ons (ponytail/rtk/caveman/all). Usage: /ai-addons <check|status|update ponytail|rtk|caveman|all> [--dry-run]",
+    description: "Check or update AI add-ons (ponytail/rtk/caveman/tokensaver/all). Usage: /ai-addons <check|status|update ponytail|rtk|caveman|tokensaver|all> [--dry-run]",
     handler: async (args, ctx) => {
       const arg = String(args || "").trim().toLowerCase();
       const parts = arg.split(/\s+/).filter(Boolean);
@@ -410,21 +500,24 @@ export default function aiAddonsUpdaterExtension(pi) {
           results.push(await updateRtk(ctx, dryRun));
         } else if (target === "caveman") {
           results.push(await updateCaveman(ctx, dryRun));
+        } else if (target === "tokensaver" || target === "token-saver" || target === "ts") {
+          results.push(await updateTokenSaver(pi, ctx, dryRun));
         } else if (target === "all") {
-          notify(ctx, `ai-addons update all${dryRun ? " dry-run" : ""}: starting ponytail → rtk → caveman sequentially…`, "info");
+          notify(ctx, `ai-addons update all${dryRun ? " dry-run" : ""}: starting ponytail → rtk → caveman → tokensaver sequentially…`, "info");
           results.push(await updatePonytail(pi, ctx, dryRun));
           results.push(await updateRtk(ctx, dryRun));
           results.push(await updateCaveman(ctx, dryRun));
+          results.push(await updateTokenSaver(pi, ctx, dryRun));
           if (!dryRun) results.push(RELOAD_MSG);
           notify(ctx, `ai-addons update all ${dryRun ? "dry-run " : ""}complete.${dryRun ? "" : ` ${RELOAD_MSG}`}`, "info");
         } else {
-          const m = "Usage: /ai-addons update <ponytail|rtk|caveman|all> [--dry-run]";
+          const m = "Usage: /ai-addons update <ponytail|rtk|caveman|tokensaver|all> [--dry-run]";
           notify(ctx, m, "warning"); return m;
         }
         return results.join("\n\n");
       }
 
-      const m = "Usage: /ai-addons <check|status|update ponytail|rtk|caveman|all> [--dry-run]";
+      const m = "Usage: /ai-addons <check|status|update ponytail|rtk|caveman|tokensaver|all> [--dry-run]";
       notify(ctx, m, "warning");
       return m;
     },

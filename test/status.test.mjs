@@ -1,7 +1,9 @@
-// Contract: every invocation path produces the same per-app status symbol, all three apps share
-// one status row (one key), and the row clears when everything is off.
+// Contract: the pack renders exactly one status row (key `modes`) whose seven knob segments are
+// byte-identical no matter which command set them, `/ts` is the only writer of what a new session
+// starts from, mode instructions reach subagents exactly once per mode set, and no extension
+// rewrites message history or tool output.
 
-import test, { after } from "node:test";
+import test, { after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,18 +12,26 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const EXT = join(dirname(fileURLToPath(import.meta.url)), "..", "extensions");
 
-// The defaults file and the ponytail plugin resolve under the real OMP home by default; point both
-// at a temp tree so a test run never edits the developer's own config.
-const SANDBOX = mkdtempSync(join(tmpdir(), "omp-combo-"));
-const DEFAULTS_FILE = join(SANDBOX, "combo-defaults.json");
+// The config, the pre-2.0 defaults file and the ponytail plugin all resolve under the real OMP home
+// by default; point all three at a temp tree so a test run never edits the developer's own install.
+const SANDBOX = mkdtempSync(join(tmpdir(), "omp-token-saver-"));
+const CONFIG_FILE = join(SANDBOX, "token-saver.json");
+const LEGACY_DEFAULTS_FILE = join(SANDBOX, "combo-defaults.json");
 const PONYTAIL_DIR = join(SANDBOX, "ponytail");
 const PONYTAIL_STUB = join(PONYTAIL_DIR, "stub-default.json");
+// A directory that does not exist: what a user without the plugin installed looks like.
+const ABSENT_PONYTAIL_DIR = join(SANDBOX, "no-ponytail");
 
-process.env.OMP_COMBO_DEFAULTS_FILE = DEFAULTS_FILE;
+process.env.OMP_TOKEN_SAVER_CONFIG = CONFIG_FILE;
+process.env.OMP_COMBO_DEFAULTS_FILE = LEGACY_DEFAULTS_FILE;
 process.env.OMP_PONYTAIL_PACKAGE_DIR = PONYTAIL_DIR;
 
+// The ponytail plugin owns its own default (its command writes this module), so the stub stands in
+// for the real one rather than for one of our modules.
 mkdirSync(join(PONYTAIL_DIR, "hooks"), { recursive: true });
-writeFileSync(join(PONYTAIL_DIR, "hooks", "ponytail-config.js"), `const fs = require("node:fs");
+writeFileSync(
+  join(PONYTAIL_DIR, "hooks", "ponytail-config.js"),
+  `const fs = require("node:fs");
 const path = require("node:path");
 const file = path.join(__dirname, "..", "stub-default.json");
 module.exports = {
@@ -30,31 +40,48 @@ module.exports = {
   },
   writeDefaultMode: (mode) => { fs.writeFileSync(file, JSON.stringify({ defaultMode: mode })); return mode; },
 };
-`);
+`
+);
 
 after(() => rmSync(SANDBOX, { recursive: true, force: true }));
 
-// `/combo default` writes both the combo file and the ponytail plugin default, so the helpers do too.
-const setDefaults = (modes) => {
-  writeFileSync(DEFAULTS_FILE, JSON.stringify(modes));
-  writeFileSync(PONYTAIL_STUB, JSON.stringify({ defaultMode: modes.ponytail }));
+// Both files mean "a stored default"; a test that wants the built-in defaults starts by deleting them.
+const clearSandboxFiles = () => {
+  for (const file of [CONFIG_FILE, LEGACY_DEFAULTS_FILE, PONYTAIL_STUB]) rmSync(file, { force: true });
 };
-const clearDefaults = () => {
-  rmSync(DEFAULTS_FILE, { force: true });
-  rmSync(PONYTAIL_STUB, { force: true });
-};
+
+beforeEach(clearSandboxFiles);
+
 const stubPonytailDefault = () => {
   try { return JSON.parse(readFileSync(PONYTAIL_STUB, "utf8")).defaultMode; } catch { return null; }
 };
 
+const withoutPonytailPlugin = async (run) => {
+  const previous = process.env.OMP_PONYTAIL_PACKAGE_DIR;
+  process.env.OMP_PONYTAIL_PACKAGE_DIR = ABSENT_PONYTAIL_DIR;
+  try { return await run(); } finally { process.env.OMP_PONYTAIL_PACKAGE_DIR = previous; }
+};
+
+// mode-reinforcement.js is the only writer of the model-facing reminder line; its closing sentence
+// is the part that differs for a subagent.
+const SUBAGENT_PROMPT = "You are operating on a piece of work assigned to you by the main agent.";
+const SUBAGENT_TAIL = "Do not weaken or disable a mode unless the main agent asks for it.";
+
+// The built-in default session, rendered: preset marker plus all seven knob segments.
+const MAX_ROW = "🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: FULL · 🔁 auto: ON";
+
 const EXTENSION_FILES = [
   join(EXT, "caveman-session", "index.js"),
   join(EXT, "rtk-session", "index.js"),
-  join(EXT, "combo-toggle", "index.js"),
+  join(EXT, "token-saver", "index.js"),
   join(EXT, "shared", "mode-reinforcement.js"),
 ];
 
-const SUBAGENT_PROMPT = "You are operating on a piece of work assigned to you by the main agent.";
+// Every pi.exec call any runtime in this file made; the last test reads it back.
+const ALL_EXEC = [];
+
+const segments = (row) => String(row).split(" · ");
+const occurrences = (text, needle) => String(text).split(needle).length - 1;
 
 function zodStub() {
   const chain = new Proxy(function () {}, {
@@ -65,18 +92,26 @@ function zodStub() {
   return new Proxy({}, { get: () => () => chain });
 }
 
-async function createRuntime(branch = []) {
+async function createRuntime(branch = [], files = EXTENSION_FILES) {
   const handlers = new Map();
   const commands = new Map();
   const status = new Map();
   const notifications = [];
   const intervals = [];
+  const execCalls = [];
   const entries = [...branch];
+  let usage;
+  let execImpl = async () => ({ code: 0, stdout: "", stderr: "" });
 
   const pi = {
     cwd: process.cwd(),
     zod: { z: zodStub() },
-    exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+    exec: async (command, args, options) => {
+      const call = { command, args: [...(args || [])], options };
+      ALL_EXEC.push(call);
+      execCalls.push(call);
+      return execImpl(command, args, options);
+    },
     setLabel() {},
     registerTool() {},
     appendEntry(customType, data) {
@@ -93,8 +128,9 @@ async function createRuntime(branch = []) {
   const ctx = {
     hasUI: true,
     cwd: process.cwd(),
+    getContextUsage: () => usage,
     ui: {
-      // omp's setHookStatus deletes the key for `undefined` and keeps any other string.
+      // OMP deletes the key on `undefined` and keeps any other string, including "".
       setStatus: (key, text) => {
         if (text === undefined) status.delete(key);
         else status.set(key, text);
@@ -110,28 +146,40 @@ async function createRuntime(branch = []) {
   };
 
   const emit = async (event, payload = {}) => {
-    for (const handler of handlers.get(event) || []) await handler(payload, ctx);
+    const results = [];
+    for (const handler of handlers.get(event) || []) results.push(await handler(payload, ctx));
+    return results;
   };
 
-  // `/combo` reloads the session so sibling extensions re-read the branch.
+  // `/ts` reloads the session so sibling extensions re-read the branch.
   ctx.reload = () => emit("session_start", {});
 
-  for (const file of EXTENSION_FILES) {
+  for (const file of files) {
     const mod = await import(pathToFileURL(file).href);
     (mod.default || mod)(pi);
   }
-
-  const appendEntry = (customType, data) => pi.appendEntry(customType, data);
 
   return {
     ctx,
     status,
     entries,
     notifications,
-    appendEntry,
+    execCalls,
+    emit,
+    appendEntry: (customType, data) => pi.appendEntry(customType, data),
     handlers: (event) => handlers.get(event) || [],
-    row: () => status.get("modes"),
+    events: () => [...handlers.keys()],
+    row: (key = "modes") => status.get(key),
     keys: () => [...status.keys()],
+    setUsage: (value) => {
+      usage = value;
+    },
+    setExec: (impl) => {
+      execImpl = impl;
+    },
+    clearExecCalls: () => {
+      execCalls.length = 0;
+    },
     run: async (name, args = "") => {
       const command = commands.get(name);
       assert.ok(command, `command /${name} is registered`);
@@ -152,17 +200,13 @@ async function createRuntime(branch = []) {
   };
 }
 
-const appSegment = (row, app) =>
-  String(row)
-    .split(" · ")
-    .find((part) => new RegExp(`\\b${app}: `).test(part)) || null;
-
-test("fresh session: one status row with stable markers for all three apps", async () => {
+test("a fresh session renders one row: the default preset with all seven knob segments", async () => {
   const rt = await createRuntime();
   await rt.start();
 
-  assert.deepEqual(rt.keys(), ["modes"]);
-  assert.equal(rt.row(), "🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA");
+  assert.deepEqual(rt.keys(), ["modes"], "the pack owns one status row");
+  assert.equal(rt.row(), MAX_ROW);
+  assert.equal(segments(rt.row()).length, 8, "preset marker + seven knobs");
 });
 
 test("session start is silent: no add-on announces itself loading", async () => {
@@ -172,164 +216,342 @@ test("session start is silent: no add-on announces itself loading", async () => 
   assert.deepEqual(rt.notifications, []);
 });
 
-test("combo, per-app commands and the plugin default agree on every per-app symbol", async () => {
-  const combo = await createRuntime();
-  await combo.start();
-  await combo.run("combo", "max");
+test("every invocation path renders the same row for the same knob values", async () => {
+  const fresh = await createRuntime();
+  await fresh.start();
+  const defaultRow = fresh.row();
 
-  const manual = await createRuntime();
-  await manual.start();
-  await manual.run("caveman", "ultra");
-  await manual.run("rtk", "on");
-  // The ponytail plugin writes this from its own `/ponytail` command.
-  manual.appendEntry("ponytail-mode", { mode: "ultra" });
-  await manual.tickWatcher();
+  const viaCombo = await createRuntime();
+  await viaCombo.start();
+  await viaCombo.run("combo", "max");
+  const comboRow = viaCombo.row();
 
-  for (const app of ["caveman", "rtk", "ponytail"]) {
-    assert.equal(appSegment(manual.row(), app), appSegment(combo.row(), app));
-  }
-  assert.equal(manual.row(), combo.row());
+  const viaTsPreset = await createRuntime();
+  await viaTsPreset.start();
+  await viaTsPreset.run("ts", "preset max");
+  const tsPresetRow = viaTsPreset.row();
+
+  // The ponytail plugin writes this entry from its own `/ponytail` command.
+  const viaPerApp = await createRuntime();
+  await viaPerApp.start();
+  await viaPerApp.run("caveman", "ultra");
+  await viaPerApp.run("rtk", "on");
+  viaPerApp.appendEntry("ponytail-mode", { mode: "ultra" });
+  await viaPerApp.tickWatcher();
+  const perAppRow = viaPerApp.row();
+
+  assert.equal(comboRow, defaultRow, "/combo max matches a fresh max session");
+  assert.equal(tsPresetRow, defaultRow, "/ts preset max matches a fresh max session");
+  assert.equal(perAppRow, defaultRow, "per-app commands match the preset they describe");
+
+  const viaTsLite = await createRuntime();
+  await viaTsLite.start();
+  await viaTsLite.run("ts", "preset lite");
+  const liteRow = viaTsLite.row();
+
+  const liteViaCombo = await createRuntime();
+  await liteViaCombo.start();
+  await liteViaCombo.run("combo", "lite");
+  const liteComboRow = liteViaCombo.row();
+
+  const liteKnobByKnob = await createRuntime();
+  await liteKnobByKnob.start();
+  await liteKnobByKnob.run("ts", "set caveman=lite ponytail=lite read=off compress=lite prune=off");
+  const liteKnobsRow = liteKnobByKnob.row();
+
+  assert.match(liteRow, /^🧩 LITE · /);
+  assert.equal(liteComboRow, liteRow, "/combo lite matches /ts preset lite");
+  assert.equal(liteKnobsRow, liteRow, "setting the same values knob by knob matches the preset");
 });
 
-test("per-app commands stay on the single row and update in place", async () => {
+test("a per-knob override changes only its segments, derives CUSTOM, and replays from the branch", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  const before = rt.row();
+
+  await rt.run("ts", "set caveman=wenyan prune=off");
+  const after = rt.row();
+
+  assert.equal(
+    after,
+    "🧩 CUSTOM · 🦴 caveman: WENYAN · 🦀 rtk: ON · 🐴 ponytail: ULTRA · 📖 read: FULL · 🗜️ compress: FULL · 🧹 prune: OFF · 🔁 auto: ON"
+  );
+  const changed = segments(after).filter((part, index) => part !== segments(before)[index]);
+  assert.deepEqual(changed, ["🧩 CUSTOM", "🦴 caveman: WENYAN", "🧹 prune: OFF"]);
+
+  const replay = await createRuntime(rt.entries);
+  await replay.start();
+  assert.equal(replay.row(), after, "a session started from the same branch restores the override");
+});
+
+test("a preset default changes new sessions only, and reset returns them to max", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  const running = rt.row();
+
+  await rt.run("ts", "default lite");
+  assert.equal(rt.row(), running, "the running session keeps its preset");
+  assert.equal(existsSync(CONFIG_FILE), true, "the new default is persisted");
+
+  const fresh = await createRuntime();
+  await fresh.start();
+  assert.match(fresh.row(), /^🧩 LITE · /);
+  assert.equal(stubPonytailDefault(), "lite", "the ponytail plugin default follows the preset");
+
+  await rt.run("ts", "default reset");
+  assert.equal(existsSync(CONFIG_FILE), false, "reset drops the stored default");
+  assert.equal(stubPonytailDefault(), "ultra", "reset restores the built-in ponytail default");
+
+  const reset = await createRuntime();
+  await reset.start();
+  assert.equal(reset.row(), MAX_ROW);
+});
+
+test("a per-knob default derives a custom default and reports the ponytail sync state", async () => {
   const rt = await createRuntime();
   await rt.start();
 
-  await rt.run("caveman", "full");
-  assert.deepEqual(rt.keys(), ["modes"]);
-  assert.match(rt.row(), /🦴 caveman: FULL/);
-  assert.match(rt.row(), /🦀 rtk: ON/);
-  assert.match(rt.row(), /🐴 ponytail: ULTRA/);
+  await rt.run("ts", "default caveman=wenyan");
+  const synced = rt.notifications.at(-1);
+  assert.match(synced.text, /Default for new sessions: CUSTOM/);
+  assert.match(synced.text, /caveman=wenyan/);
+  assert.doesNotMatch(synced.text, /pending/i, "a synced plugin reports no pending work");
 
-  await rt.run("caveman", "off");
-  assert.deepEqual(rt.keys(), ["modes"]);
-  assert.match(rt.row(), /🦴 caveman: OFF/);
+  const fresh = await createRuntime();
+  await fresh.start();
+  assert.match(fresh.row(), /^🧩 CUSTOM · 🦴 caveman: WENYAN · /);
+
+  await withoutPonytailPlugin(async () => {
+    await rt.run("ts", "default ponytail=full");
+    const pending = rt.notifications.at(-1);
+    assert.equal(pending.type, "warning");
+    assert.match(pending.text, /Ponytail plugin not found/);
+  });
 });
 
-test("a ponytail-mode entry written by the plugin reaches the row", async () => {
+test("status=off deletes the row while the other knobs stay applied", async () => {
   const rt = await createRuntime();
   await rt.start();
 
-  rt.appendEntry("ponytail-mode", { mode: "lite" });
-  await rt.tickWatcher();
+  await rt.run("ts", "set caveman=lite status=off");
+  assert.deepEqual(rt.keys(), [], "an off status deletes the key instead of leaving it empty");
+  assert.equal(rt.row(), undefined);
 
+  await rt.run("ts", "status");
+  const report = rt.notifications.at(-1).text;
+  assert.match(report, /caveman=lite/, "the other knobs are still set");
+  assert.match(report, /status=off/);
+  assert.deepEqual(rt.keys(), [], "reporting status does not resurrect the row");
+
+  await rt.run("ts", "set status=full");
   assert.deepEqual(rt.keys(), ["modes"]);
-  assert.match(rt.row(), /🐴 ponytail: LITE/);
+  assert.match(rt.row(), /🦴 caveman: LITE/);
 });
 
-test("everything off clears the row", async () => {
-  const rt = await createRuntime();
-  await rt.start();
-  await rt.run("combo", "off");
-
-  assert.deepEqual(rt.keys(), [], "an empty status string still draws a row, so the key must go");
-});
-
-test("a session with /combo off entries stays off", async () => {
-  const rt = await createRuntime([
-    { type: "custom", customType: "caveman-mode", data: { mode: "off" }, id: "b1" },
-    { type: "custom", customType: "rtk-mode", data: { enabled: false }, id: "b2" },
-    { type: "custom", customType: "ponytail-mode", data: { mode: "off" }, id: "b3" },
-    { type: "custom", customType: "combo-level", data: { level: "off" }, id: "b4" },
-  ]);
-  await rt.start();
-
-  assert.deepEqual(rt.keys(), []);
-});
-
-test("subagents inherit caveman and rtk", async () => {
+test("subagent prompts inherit the caveman and rtk blocks", async () => {
   const rt = await createRuntime();
   await rt.start();
 
   const prompt = await rt.runBeforeAgentStart(SUBAGENT_PROMPT);
 
-  assert.match(prompt, /Caveman ultra/);
-  assert.match(prompt, /RTK mode active/);
+  assert.match(prompt, /Caveman ultra active for this session/);
+  assert.match(prompt, /RTK mode active for this session/);
+  assert.equal(occurrences(prompt, SUBAGENT_TAIL), 1, "the reinforcement line is added once");
 });
 
-test("a fresh session starts from the persisted default", async () => {
-  setDefaults({ caveman: "off", rtk: "off", ponytail: "off" });
-  try {
-    const rt = await createRuntime();
-    await rt.start();
-    assert.deepEqual(rt.keys(), []);
-  } finally {
-    clearDefaults();
+test("the mode-reinforcement line is appended at most once for a mode set", async () => {
+  const rt = await createRuntime([], [join(EXT, "shared", "mode-reinforcement.js")]);
+  await rt.start();
+
+  const first = await rt.runBeforeAgentStart(SUBAGENT_PROMPT);
+  assert.equal(occurrences(first, SUBAGENT_TAIL), 1);
+
+  const second = await rt.runBeforeAgentStart(first);
+  assert.equal(second, first, "re-asserting the same mode set appends nothing");
+});
+
+test("nothing is appended when every knob is off", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  await rt.run("ts", "preset off");
+
+  assert.deepEqual(rt.keys(), ["modes"], "the row stays: it reports that everything is off");
+
+  const prompt = await rt.runBeforeAgentStart(SUBAGENT_PROMPT);
+  assert.equal(prompt, SUBAGENT_PROMPT, "no mode is active, so no instruction is injected");
+});
+
+test("the meter renders the context usage it is handed", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  rt.setUsage({ percent: 42 });
+  await rt.emit("turn_end", {});
+  assert.match(rt.row(), /👁 42% ctx/);
+  assert.match(rt.row(), /^🧩 MAX · /);
+
+  rt.setUsage(undefined);
+  await rt.emit("turn_end", {});
+  assert.equal(rt.row(), MAX_ROW, "no usage, no meter, no throw");
+});
+
+test("autoRtk off never spawns rtk and leaves the command alone", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  await rt.run("rtk", "auto off");
+
+  rt.setExec(async () => {
+    throw new Error("autoRtk is off; rtk must not be spawned");
+  });
+  rt.clearExecCalls();
+
+  const event = { toolName: "bash", input: { command: "git status" } };
+  const [result] = await rt.emit("tool_call", event);
+
+  assert.equal(result, undefined);
+  assert.deepEqual(rt.execCalls, []);
+  assert.deepEqual(event.input, { command: "git status" });
+});
+
+test("autoRtk on returns a revised command without mutating the event", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  rt.setExec(async (_command, args) =>
+    args.includes("rewrite")
+      ? { code: 0, stdout: "rtk git log --oneline -5", stderr: "" }
+      : { code: 0, stdout: "", stderr: "" }
+  );
+
+  const event = { toolName: "bash", input: { command: "git log --oneline -5", timeout: 5000 } };
+  const [result] = await rt.emit("tool_call", event);
+
+  assert.deepEqual(result, { input: { command: "rtk git log --oneline -5", timeout: 5000 } });
+  assert.deepEqual(event.input, { command: "git log --oneline -5", timeout: 5000 });
+  assert.equal(rt.execCalls.length, 1, "one rewrite subprocess");
+});
+
+test("shell syntax, an existing rtk prefix and the exclude list all skip the subprocess", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  rt.setExec(async () => {
+    throw new Error("this command must not be handed to rtk");
+  });
+
+  for (const command of [
+    "cat notes.md | head -5",
+    "npm run build && npm run test",
+    "ls; ls",
+    "echo `date`",
+    "echo $(date)",
+    "rtk git status",
+  ]) {
+    rt.clearExecCalls();
+    const [result] = await rt.emit("tool_call", { toolName: "bash", input: { command } });
+    assert.equal(result, undefined, `no rewrite for ${command}`);
+    assert.deepEqual(rt.execCalls, [], `no subprocess for ${command}`);
   }
+
+  await rt.run("ts", 'option autoRtk.exclude=["git log"]');
+  await rt.start();
+
+  rt.clearExecCalls();
+  const [excluded] = await rt.emit("tool_call", { toolName: "bash", input: { command: "git log --all" } });
+  assert.equal(excluded, undefined, "an excluded command is left alone");
+  assert.deepEqual(rt.execCalls, []);
 });
 
-test("per-app defaults derive a custom level for fresh sessions", async () => {
-  setDefaults({ caveman: "lite", rtk: "on", ponytail: "ultra" });
-  try {
-    const rt = await createRuntime();
-    await rt.start();
-    assert.match(rt.row(), /^🧩 CUSTOM · 🦴 caveman: LITE · 🦀 rtk: ON · 🐴 ponytail: ULTRA$/);
-  } finally {
-    clearDefaults();
-  }
+test("the pack registers no context and no tool_result handler", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  assert.deepEqual(rt.handlers("context"), [], "message history is OMP's to rewrite");
+  assert.deepEqual(rt.handlers("tool_result"), [], "tool output is OMP's to rewrite");
+  assert.deepEqual(
+    rt.events().filter((event) => event === "context" || event === "tool_result"),
+    [],
+    "the registered event map carries neither"
+  );
 });
 
-test("/combo default persists a level without changing the running session", async () => {
+test("/ts native status renders the key table and a missing omp degrades to a warning", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  rt.setExec(async (_command, args) => {
+    const argv = args.join(" ");
+    if (argv.includes("config list")) {
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          "read.defaultLimit": { value: 200 },
+          "read.summarize.enabled": { value: true },
+        }),
+        stderr: "",
+      };
+    }
+    if (argv.includes("config path")) return { code: 0, stdout: join(SANDBOX, "agent"), stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+
+  await rt.run("ts", "native status");
+  const table = rt.notifications.at(-1);
+  assert.equal(table.type, "info");
+  assert.match(table.text, /Native OMP settings/);
+  assert.match(table.text, /read\.defaultLimit: 200/);
+  assert.match(table.text, /read\.summarize\.enabled: true/);
+  assert.ok(
+    (table.text.match(/^[=→] \S+:/gm) || []).length >= 10,
+    "every mapped key gets a row"
+  );
+
+  const broken = await createRuntime();
+  await broken.start();
+  broken.setExec(async () => {
+    throw new Error("spawn omp ENOENT");
+  });
+
+  await broken.run("ts", "native status");
+  const warning = broken.notifications.at(-1);
+  assert.equal(warning.type, "warning");
+  assert.match(warning.text, /Unavailable: spawn omp ENOENT/);
+});
+
+// Last: reads back every pi.exec call the whole file made. Nothing above may drive `omp config
+// set` / `reset` — only the tests that stub `omp` explicitly would be allowed to.
+test("no test path writes native OMP settings", () => {
+  assert.ok(ALL_EXEC.length > 0, "the file exercised the exec seam");
+  const writes = ALL_EXEC.filter((call) => /config (set|reset)/.test(call.args.join(" ")));
+  assert.deepEqual(writes, []);
+});
+
+test("/ts set accepts a camelCase knob typed in any case", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  await rt.run("ts", "set autoRtk=off");
+  assert.match(rt.row(), /🔁 auto: OFF/);
+  assert.deepEqual(
+    rt.entries.filter((entry) => entry.customType === "ts-mode").map((entry) => entry.data),
+    [{ name: "autoRtk", value: "off" }],
+    "the knob is stored under its canonical name"
+  );
+
+  await rt.run("ts", "set AUTORTK=on");
+  assert.match(rt.row(), /🔁 auto: ON/);
+});
+
+test("/combo keeps the pre-2.0 default verb and refuses the newer knobs", async () => {
   const rt = await createRuntime();
   await rt.start();
   const running = rt.row();
 
-  await rt.run("combo", "default medium");
+  await rt.run("combo", "default lite");
+  assert.equal(rt.row(), running, "the running session keeps its preset");
+  assert.match(rt.notifications.at(-1).text, /Default for new sessions: LITE/);
 
-  assert.equal(rt.row(), running, "the running session keeps its level");
-  assert.deepEqual(JSON.parse(readFileSync(DEFAULTS_FILE, "utf8")), {
-    caveman: "lite",
-    rtk: "on",
-    ponytail: "lite",
-  });
-  assert.equal(stubPonytailDefault(), "lite", "the ponytail plugin default is synced");
-
-  const fresh = await createRuntime();
-  await fresh.start();
-  assert.match(fresh.row(), /^🧩 MEDIUM · 🦴 caveman: LITE · 🦀 rtk: ON · 🐴 ponytail: LITE$/);
-
-  await fresh.run("combo", "default reset");
-  assert.equal(existsSync(DEFAULTS_FILE), false, "reset drops the override");
-  assert.equal(stubPonytailDefault(), "ultra", "reset returns ponytail to the built-in default");
-
-  const reset = await createRuntime();
-  await reset.start();
-  assert.match(reset.row(), /^🧩 MAX · 🦴 caveman: ULTRA · 🦀 rtk: ON · 🐴 ponytail: ULTRA$/);
-});
-
-test("a caveman/rtk-only default leaves the ponytail plugin default alone", async () => {
-  setDefaults({ caveman: "lite", rtk: "on", ponytail: "ultra" });
-  // The user chose this with /ponytail default lite; a partial /combo default must not clobber it.
-  writeFileSync(PONYTAIL_STUB, JSON.stringify({ defaultMode: "lite" }));
-  try {
-    const rt = await createRuntime();
-    await rt.start();
-
-    await rt.run("combo", "default caveman=off rtk=off");
-
-    assert.equal(stubPonytailDefault(), "lite", "the ponytail default is untouched");
-    assert.deepEqual(JSON.parse(readFileSync(DEFAULTS_FILE, "utf8")), {
-      caveman: "off",
-      rtk: "off",
-      ponytail: "ultra",
-    });
-    assert.match(rt.notifications.at(-1).text, /^Combo default for new sessions: CUSTOM \(caveman=off rtk=off ponytail=lite\)/);
-  } finally {
-    clearDefaults();
-  }
-});
-
-test("a default the ponytail plugin cannot run is refused", async () => {
-  clearDefaults();
-  try {
-    const rt = await createRuntime();
-    await rt.start();
-
-    await rt.run("combo", "default ponytail=review");
-
-    assert.equal(existsSync(DEFAULTS_FILE), false);
-    assert.match(rt.notifications.at(-1).text, /^Usage: \/combo default/);
-  } finally {
-    clearDefaults();
-  }
+  await rt.run("combo", "set caveman=lite");
+  const refused = rt.notifications.at(-1);
+  assert.equal(refused.type, "warning");
+  assert.match(refused.text, /Unknown preset: set/);
+  assert.equal(rt.row(), running, "a refused verb changes nothing");
 });

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// install-omp-addons.js — Install caveman/rtk/ponytail add-ons on any OMP device.
+// install-omp-addons.js — Install the Supreme Token Saver add-ons on any OMP device.
 // Usage: node install-omp-addons.js [install|update|reinstall|doctor|uninstall|version|help] [options]
 // Requires: node/npm and omp CLI
 
@@ -22,15 +22,17 @@ const PACKAGE_NAME = "@dillydalli3r/oh-my-pi-supreme-token-saver";
 const PACKAGE_BIN = "oh-my-pi-supreme-token-saver";
 // Fallback source for `update` while the fork is not published under PACKAGE_NAME yet.
 const GIT_SOURCE = "github:dillydalli3r/oh-my-pi-supreme-token-saver";
-// Ponytail session default: ultra keeps a fresh session identical to `/combo max`.
+// Ponytail session default: ultra keeps a fresh session identical to `/token-saver preset max`.
 const PONYTAIL_DEFAULT_MODE = "ultra";
 const { version: PACKAGE_VERSION } = createRequire(import.meta.url)("./package.json");
 
 // --- CLI flags ---
 
 const args = process.argv.slice(2);
+// Flags that consume the next argv entry: without this the value ("user", "max") reads as a command.
+const VALUE_FLAGS = new Set(["--scope", "--preset"]);
 const COMMANDS = new Set(["install", "update", "reinstall", "doctor", "uninstall", "version", "help"]);
-const commandArg = args.find((arg, index) => !arg.startsWith("-") && args[index - 1] !== "--scope");
+const commandArg = args.find((arg, index) => !arg.startsWith("-") && !VALUE_FLAGS.has(args[index - 1]));
 const command = commandArg?.toLowerCase() || null;
 const unknownCommand = command !== null && !COMMANDS.has(command);
 const install = command === "install";
@@ -46,6 +48,17 @@ const doctor = command === "doctor" || args.includes("--doctor");
 const uninstall = command === "uninstall" || args.includes("--uninstall");
 const removePonytail = args.includes("--remove-ponytail");
 const removeRtk = args.includes("--remove-rtk");
+
+const forcePreset = args.includes("--force-preset");
+
+// `--preset max` and `--preset=max` both work, matching how --scope is read.
+const presetFlag = (() => {
+  const inline = args.find((arg) => arg.startsWith("--preset="));
+  if (inline) return inline.slice("--preset=".length).trim() || null;
+  const i = args.indexOf("--preset");
+  if (i === -1) return null;
+  return args[i + 1]?.trim() || null;
+})();
 
 const scopeFlag = (() => {
   // Accept both `--scope user` and `--scope=user`; the inline form used to be ignored silently,
@@ -70,12 +83,23 @@ Commands:
   help         Show this help
 
 Options:
-  --scope user|project|both
+  --scope user|project|both    Install scope (default user)
+  --preset <off|lite|medium|high|max|ultra>
+                               Default preset for new sessions; written to
+                               ~/.omp/agent/token-saver.json only when that file
+                               does not exist yet (add --force-preset to overwrite)
+  --force-preset               Let --preset overwrite an existing token-saver.json
+  --remove-ponytail            Uninstall: also drop the Ponytail plugin entry
+  --remove-rtk                 Uninstall: also delete the rtk binary
   --yes, -y
   --dry-run
   --verbose
   --version, -v
-  --help, -h`);
+  --help, -h
+
+The extension ships one command surface: /token-saver (alias /ts), with /combo kept
+as a preset-only alias. The presets (off, lite, medium, high, max, ultra) drive all
+eight knobs — caveman, rtk, ponytail, read, compress, prune, autoRtk, status.`);
 }
 
 function debug(...a) {
@@ -97,11 +121,21 @@ const SHARED_STATUS_LINE = path.join(EXT_DIR, "shared", "status-line.js");
 const CAVEMAN_INDEX = path.join(EXT_DIR, "caveman-session", "index.js");
 const RTK_SESSION_INDEX = path.join(EXT_DIR, "rtk-session", "index.js");
 const UPDATER_INDEX = path.join(EXT_DIR, "ai-addons-updater", "index.js");
-const COMBO_TOGGLE_INDEX = path.join(EXT_DIR, "combo-toggle", "index.js");
+const TOKEN_SAVER_DIR = path.join(EXT_DIR, "token-saver");
+const TOKEN_SAVER_INDEX = path.join(TOKEN_SAVER_DIR, "index.js");
 const AMANAI_REWARD_INDEX = path.join(EXT_DIR, "amanai-reward", "index.js");
+// Pre-2.0 shipped a separate combo extension directory that registered a duplicate /combo command;
+// 2.0 folds that surface into token-saver. The stale directory name is spelled out once, here, so
+// no other line hardcodes it.
+const STALE_COMBO_DIRNAME = "combo-toggle";
 const MODE_REINFORCEMENT_INDEX = path.join(EXT_DIR, "shared", "mode-reinforcement.js");
 const CAVEMAN_REMOTE_RULE = "https://raw.githubusercontent.com/JuliusBrussee/caveman/main/src/rules/caveman-activate.md";
 const RTK_RELEASE_API = "https://api.github.com/repos/rtk-ai/rtk/releases/latest";
+
+// Mirrors PRESET_NAMES / DEFAULT_PRESET in extensions/shared/session-state.js. Duplicated instead of
+// imported so `--version`, `help`, and a dry run never depend on the extension tree loading.
+const PRESET_NAMES = ["off", "lite", "medium", "high", "max", "ultra"];
+const DEFAULT_PRESET = "max";
 
 // --- Helpers ---
 
@@ -116,6 +150,11 @@ async function sha256File(filePath) {
 
 async function readIfExists(p) {
   try { return await fs.readFile(p, "utf8"); } catch { return null; }
+}
+
+// readIfExists reads files only — an existing directory makes it throw and report "missing".
+async function dirExists(p) {
+  try { return (await fs.stat(p)).isDirectory(); } catch { return false; }
 }
 
 function parseChecksum(checksumsText, assetName) {
@@ -298,7 +337,7 @@ async function ensureExtensionAfterConfigEntry(configPath, extensionPath, afterP
 // hideStatus keeps the plugin's own status row hidden: the unified one-line row from
 // shared/status-line.js is the single place a mode is displayed, so the ponytail marker no longer
 // depends on how the mode was set. quietStartup drops the "Ponytail loaded: <mode>" toast the
-// plugin raises on session_start, which duplicated the combo row on every new session.
+// plugin raises on session_start, which duplicated the status row on every new session.
 function ponytailConfigDir() {
   if (process.env.XDG_CONFIG_HOME) return path.join(process.env.XDG_CONFIG_HOME, "ponytail");
   if (IS_WINDOWS) return path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"), "ponytail");
@@ -328,7 +367,7 @@ async function ensurePonytailConfig(options = {}) {
     }
   }
 
-  // A default chosen in-session (`/ponytail default`, `/combo default`) outranks the install
+  // A default chosen in-session (`/ponytail default`, `/token-saver default`) outranks the install
   // default, so only fill defaultMode in when nothing has set one.
   const seedMode = config.defaultMode === undefined ? PONYTAIL_DEFAULT_MODE : null;
 
@@ -350,7 +389,8 @@ async function ensurePonytailConfig(options = {}) {
 
 async function stepPonytail(pluginsDir, userDir, options = {}) {
   console.log("\n[1/7] Installing Ponytail plugin...");
-  await fs.mkdir(pluginsDir, { recursive: true });
+  // Nothing on disk during a dry run — an empty ~/.omp/plugins would still be a change.
+  if (!options.dryRun) await fs.mkdir(pluginsDir, { recursive: true });
   const pkgPath = path.join(pluginsDir, "package.json");
   let pkg = {};
   const existing = await readIfExists(pkgPath);
@@ -476,30 +516,42 @@ async function stepPonytail(pluginsDir, userDir, options = {}) {
 
 async function stepRtk(binDir, options = {}) {
   console.log("\n[2/7] Installing RTK binary...");
+
+  // Map (platform, arch) → Rust triple stem.
+  const PLATFORM = process.platform;
+  const ARCH = process.arch;
+  let assetTriple;
+  if (PLATFORM === "win32" && ARCH === "x64") {
+    assetTriple = "x86_64-pc-windows-msvc";
+  } else if (PLATFORM === "linux" && ARCH === "x64") {
+    assetTriple = "x86_64-unknown-linux-musl";
+  } else if (PLATFORM === "linux" && ARCH === "arm64") {
+    assetTriple = "aarch64-unknown-linux-gnu";
+  } else if (PLATFORM === "darwin" && ARCH === "x64") {
+    assetTriple = "x86_64-apple-darwin";
+  } else if (PLATFORM === "darwin" && ARCH === "arm64") {
+    assetTriple = "aarch64-apple-darwin";
+  } else {
+    console.log(`  [fail] Unsupported platform: ${PLATFORM}/${ARCH}`);
+    console.log(`  [hint] Manual: https://github.com/rtk-ai/rtk/releases`);
+    return;
+  }
+
+  const binDest = path.join(binDir, IS_WINDOWS ? "rtk.exe" : "rtk");
+
+  // A dry run stays offline: the asset name is derivable from the platform, so the release lookup
+  // (and the download it would trigger) is skipped entirely.
+  if (options.dryRun) {
+    console.log(`  [dry-run] would download rtk-${assetTriple}.<zip|tar.gz> from the latest GitHub release`);
+    console.log(`  [dry-run] would verify checksum against checksums.txt`);
+    console.log(`  [dry-run] would extract and install to ${binDest}`);
+    return;
+  }
+
   try {
     const raw = await httpsGet(RTK_RELEASE_API);
     const release = JSON.parse(raw);
     const tag = release.tag_name;
-
-    // Map (platform, arch) → Rust triple stem.
-    const PLATFORM = process.platform;
-    const ARCH = process.arch;
-    let assetTriple;
-    if (PLATFORM === "win32" && ARCH === "x64") {
-      assetTriple = "x86_64-pc-windows-msvc";
-    } else if (PLATFORM === "linux" && ARCH === "x64") {
-      assetTriple = "x86_64-unknown-linux-musl";
-    } else if (PLATFORM === "linux" && ARCH === "arm64") {
-      assetTriple = "aarch64-unknown-linux-gnu";
-    } else if (PLATFORM === "darwin" && ARCH === "x64") {
-      assetTriple = "x86_64-apple-darwin";
-    } else if (PLATFORM === "darwin" && ARCH === "arm64") {
-      assetTriple = "aarch64-apple-darwin";
-    } else {
-      console.log(`  [fail] Unsupported platform: ${PLATFORM}/${ARCH}`);
-      console.log(`  [hint] Manual: https://github.com/rtk-ai/rtk/releases`);
-      return;
-    }
 
     const asset = (release.assets || []).find((a) =>
       a.name === `rtk-${assetTriple}.zip` || a.name === `rtk-${assetTriple}.tar.gz`
@@ -507,15 +559,6 @@ async function stepRtk(binDir, options = {}) {
     if (!asset) {
       console.log(`  [fail] No rtk-${assetTriple}.<zip|tar.gz> in release ${tag}`);
       console.log(`  [hint] Available: ${(release.assets || []).map((a) => a.name).filter((n) => n.startsWith("rtk-")).join(", ")}`);
-      return;
-    }
-
-    const binDest = path.join(binDir, IS_WINDOWS ? "rtk.exe" : "rtk");
-
-    if (options.dryRun) {
-      console.log(`  [dry-run] would download ${asset.name} from release ${tag}`);
-      console.log(`  [dry-run] would verify checksum against checksums.txt`);
-      console.log(`  [dry-run] would extract and install to ${binDest}`);
       return;
     }
 
@@ -706,19 +749,77 @@ async function stepCaveman(extDir, options = {}) {
   }
 }
 
-async function stepCombo(extDir, options = {}) {
-  console.log("\n[5/7] Installing Combo toggle extension...");
-  const src = await readIfExists(COMBO_TOGGLE_INDEX);
+// 2.0 install steps, in order: 1 Ponytail, 2 RTK binary, 3 RTK session, 4 Caveman, 5 Token Saver
+// (session knobs + the /token-saver command surface), 6 mode reinforcement, 7 Amanai reward.
+async function stepTokenSaver(extDir, options = {}) {
+  console.log("\n[5/7] Installing Token Saver extension...");
+  const configPath = path.join(path.dirname(extDir), "config.yml");
+
+  // Pre-2.0 installs left the old combo directory behind, which registers a second /combo command
+  // next to the one token-saver now owns. Remove it rather than let OMP load both.
+  const staleDir = path.join(extDir, STALE_COMBO_DIRNAME);
+  if (await dirExists(staleDir)) {
+    if (options.dryRun) {
+      console.log(`  [dry-run] would remove ${staleDir}`);
+    } else {
+      await fs.rm(staleDir, { recursive: true, force: true });
+      console.log(`  [remove] ${staleDir}`);
+    }
+  }
+
+  // The same install also listed it in config.yml. A dangling entry there still gets loaded, so the
+  // line goes even when the directory was already gone.
+  const configRaw = await readIfExists(configPath);
+  if (configRaw) {
+    const lines = configRaw.split("\n");
+    const kept = lines.filter((l) => !l.includes(STALE_COMBO_DIRNAME));
+    if (kept.length !== lines.length) {
+      const count = lines.length - kept.length;
+      if (options.dryRun) {
+        console.log(`  [dry-run] would remove ${count} ${STALE_COMBO_DIRNAME} entries from config.yml`);
+      } else {
+        await fs.writeFile(configPath, kept.join("\n"), "utf8");
+        console.log(`  [write] Removed ${count} ${STALE_COMBO_DIRNAME} entries from config.yml`);
+      }
+    }
+  }
+
+  const src = await readIfExists(TOKEN_SAVER_INDEX);
   if (!src) {
-    console.log("  [skip] combo-toggle/index.js not found in repo");
+    console.log("  [skip] token-saver/index.js not found in repo");
     return;
   }
-  const dest = path.join(extDir, "combo-toggle", "index.js");
+  const dest = path.join(extDir, "token-saver", "index.js");
   await writeIfChanged(dest, src, options);
 
-  // Auto-register combo in config.yml
-  const configPath = path.join(path.dirname(extDir), "config.yml");
-  await ensureExtensionInConfig(configPath, dest, "combo", options);
+  // Register the command surface explicitly so /token-saver works without a manual config.yml edit.
+  await ensureExtensionInConfig(configPath, dest, "token-saver", options);
+}
+
+// The file a fresh session reads its defaults from. OMP_TOKEN_SAVER_CONFIG wins, matching
+// CONFIG_FILE in extensions/shared/session-state.js.
+function tokenSaverConfigPath() {
+  return process.env.OMP_TOKEN_SAVER_CONFIG || path.join(HOME, ".omp", "agent", "token-saver.json");
+}
+
+// First run only: seed the default preset. An existing file is the user's choice and is left alone
+// unless --preset came with --force-preset, so an update never resets a session preset.
+async function stepTokenSaverConfig(options = {}) {
+  const configPath = tokenSaverConfigPath();
+  const preset = options.preset || DEFAULT_PRESET;
+  const exists = (await readIfExists(configPath)) !== null;
+
+  if (exists && !(options.preset && options.forcePreset)) {
+    console.log(`  [info] ${configPath} already exists — left as-is (change it in-session with /token-saver preset <name>)`);
+    return;
+  }
+
+  if (options.dryRun) {
+    console.log(`  [dry-run] would write ${configPath} with preset "${preset}"`);
+    return;
+  }
+
+  await writeIfChanged(configPath, `${JSON.stringify({ version: 2, preset }, null, 2)}\n`, options);
 }
 
 async function stepAmanaiReward(extDir, options = {}) {
@@ -814,6 +915,21 @@ async function runDoctor() {
     }
   }
 
+  // RTK's own savings report, from the managed binary when it exists, else whatever `rtk` is on PATH.
+  // Only the head is printed: the full table is long, and the numbers are what rtk counts locally,
+  // not something this installer can verify.
+  try {
+    const gain = (await execCli(rtkExists ? rtkBin : "rtk", ["gain"], { timeout: 5000 })).stdout
+      .split(/\r?\n/)
+      .slice(0, 6)
+      .join("\n")
+      .trimEnd();
+    console.log("  rtk self-report: RTK's numbers are self-reported by the rtk binary, not independently verified.");
+    for (const line of gain.split("\n")) console.log(`    ${line}`);
+  } catch (e) {
+    console.log(`  rtk self-report: unavailable (${e.message.split("\n")[0]})`);
+  }
+
   // Caveman
   const cavemanIndex = path.join(extDir, "caveman-session", "index.js");
   const cavemanRule = path.join(extDir, "caveman-session", "rule.md");
@@ -828,22 +944,27 @@ async function runDoctor() {
   const updaterIndex = path.join(extDir, "ai-addons-updater", "index.js");
   console.log(`  Updater extension: ${(await readIfExists(updaterIndex)) !== null ? "installed" : "MISSING"}`);
 
-  // Combo
-  const comboIndex = path.join(extDir, "combo-toggle", "index.js");
-  console.log(`  Combo extension: ${(await readIfExists(comboIndex)) !== null ? "installed" : "MISSING"}`);
+  // Token Saver extension (owns the session knobs and the /token-saver command surface)
+  const tokenSaverIndex = path.join(extDir, "token-saver", "index.js");
+  console.log(`  Token Saver extension: ${(await readIfExists(tokenSaverIndex)) !== null ? "installed" : "MISSING"}`);
 
-  const comboDefaultsPath = path.join(agentDir, "combo-defaults.json");
-  const comboDefaultsRaw = await readIfExists(comboDefaultsPath);
-  let comboDefault = "max (built-in)";
-  if (comboDefaultsRaw) {
+  const tokenSaverConfig = tokenSaverConfigPath();
+  const tokenSaverRaw = await readIfExists(tokenSaverConfig);
+  if (tokenSaverRaw) {
+    let preset = "?";
     try {
-      const parsed = JSON.parse(comboDefaultsRaw.replace(/^\uFEFF/, ""));
-      comboDefault = `caveman=${parsed?.caveman ?? "ultra"} rtk=${parsed?.rtk ?? "on"} ponytail=${parsed?.ponytail ?? "max default"}`;
+      preset = JSON.parse(tokenSaverRaw.replace(/^\uFEFF/, ""))?.preset ?? "?";
     } catch {
-      comboDefault = `unreadable ${comboDefaultsPath}`;
+      preset = `unreadable`;
     }
+    console.log(`  Token Saver config: ok preset=${preset} ${tokenSaverConfig}`);
+  } else {
+    console.log(`  Token Saver config: MISSING (sessions fall back to ${DEFAULT_PRESET}) ${tokenSaverConfig}`);
   }
-  console.log(`  Combo session default: ${comboDefault}`);
+
+  // Pre-2.0 leftovers: the stale directory registers a duplicate /combo command.
+  const staleComboDir = path.join(extDir, STALE_COMBO_DIRNAME);
+  console.log(`  ${STALE_COMBO_DIRNAME} (pre-2.0): ${(await dirExists(staleComboDir)) ? `STALE ${staleComboDir}` : "ok absent"}`);
 
   const modeReinforcement = path.join(extDir, "shared", "mode-reinforcement.js");
   console.log(`  Mode reinforcement extension: ${(await readIfExists(modeReinforcement)) !== null ? "installed" : "MISSING"}`);
@@ -854,8 +975,11 @@ async function runDoctor() {
 
   if (configOk) {
     const configText = await readIfExists(configPath);
-    const hasComboPath = configText.includes("combo-toggle");
-    console.log(`  Combo in config.yml: ${hasComboPath ? "registered" : "MISSING"}`);
+    const hasTokenSaverPath = configText.includes("token-saver");
+    console.log(`  Token Saver in config.yml: ${hasTokenSaverPath ? "registered" : "MISSING"}`);
+    if (configText.includes(STALE_COMBO_DIRNAME)) {
+      console.log(`  [warn] config.yml still lists ${STALE_COMBO_DIRNAME} — rerun: install --yes`);
+    }
   }
 }
 
@@ -876,8 +1000,9 @@ async function runUninstall(options = {}) {
   const targets = [
     path.join(extDir, "caveman-session"),
     path.join(extDir, "rtk-session"),
+    path.join(extDir, "token-saver"),
     path.join(extDir, "ai-addons-updater"),
-    path.join(extDir, "combo-toggle"),
+    path.join(extDir, STALE_COMBO_DIRNAME),
     path.join(extDir, "shared"),
     path.join(extDir, "amanai-reward"),
   ];
@@ -913,13 +1038,14 @@ async function runUninstall(options = {}) {
     }
   }
 
-  // Remove Combo and mode-reinforcement registrations; Ponytail only when requested.
+  // Remove the token-saver registration (plus any pre-2.0 combo leftover) and
+  // mode-reinforcement; Ponytail only when requested.
   const configRaw = await readIfExists(configPath);
   if (configRaw) {
     let lines = configRaw.split("\n");
     const before = lines.length;
     lines = lines.filter((l) => {
-      if (l.includes("combo-toggle") || l.includes("mode-reinforcement")) return false;
+      if (l.includes("token-saver") || l.includes(STALE_COMBO_DIRNAME) || l.includes("mode-reinforcement")) return false;
       if (shouldRemovePonytail && l.includes("ponytail") && l.includes("pi-extension")) return false;
       return true;
     });
@@ -1045,6 +1171,13 @@ async function main() {
     return;
   }
 
+  if (presetFlag && !PRESET_NAMES.includes(presetFlag)) {
+    console.error(`[fail] Invalid --preset: ${presetFlag}. Use: ${PRESET_NAMES.join(", ")}`);
+    process.exitCode = 1;
+    closeRL();
+    return;
+  }
+
   if (doctor) {
     await runDoctor();
     closeRL();
@@ -1099,7 +1232,7 @@ async function main() {
   const bunBinDir = path.join(HOME, ".bun", "bin");
   const projectExtDir = path.join(process.cwd(), ".omp", "extensions");
 
-  const options = { dryRun, verbose, yes, scope, reinstall };
+  const options = { dryRun, verbose, yes, scope, reinstall, preset: presetFlag, forcePreset };
 
   // Check prerequisites
   console.log("\nPrerequisites:");
@@ -1119,7 +1252,7 @@ async function main() {
     await stepRtk(bunBinDir, options);
     await stepRtkSession(userExtDir, options);
     await stepCaveman(userExtDir, options);
-    await stepCombo(userExtDir, options);
+    await stepTokenSaver(userExtDir, options);
     await stepModeReinforcement(userExtDir, ponytailExtPath, options);
     await stepAmanaiReward(userExtDir, options);
   }
@@ -1130,18 +1263,23 @@ async function main() {
     await stepRtkSession(projectExtDir, options);
     await stepCaveman(projectExtDir, options);
     await stepAmanaiReward(projectExtDir, options);
-    console.log("  [note] Ponytail, RTK binary, and Combo toggle require user-level (global) install");
+    console.log("  [note] Token Saver, Ponytail, and the RTK binary are user-level (global) installs");
   }
 
+  // After the extensions, so a first-run preset lands next to an installed command surface.
+  console.log("\n--- Token Saver defaults ---");
+  await stepTokenSaverConfig(options);
+
   console.log("\n=== Installation complete ===");
+  console.log(`\nDefaults file: ${tokenSaverConfigPath()}`);
   console.log("\nNext steps:");
   console.log("  1. Restart OMP");
-  console.log("  2. /caveman full");
-  console.log("  3. /rtk on");
-  console.log("  4. /ponytail full");
-  console.log("  5. /ai-addons check");
-  console.log("  6. /combo max   (all 3 at once; fresh sessions already start at max)");
-  console.log("  7. /combo default   (change what new sessions start from)");
+  console.log("  2. /token-saver status        (alias: /ts)");
+  console.log("  3. /token-saver preset high   (off | lite | medium | high | max | ultra)");
+  console.log("  4. /token-saver set caveman=ultra   (per-knob override)");
+  console.log("  5. /token-saver default       (what fresh sessions start from)");
+  console.log("  6. /combo                     (preset-only alias)");
+  console.log("  7. /ai-addons check");
 
   closeRL();
 }
