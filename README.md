@@ -20,10 +20,10 @@ cd oh-my-pi-supreme-token-saver
 node install-omp-addons.js install --yes
 ```
 
-Without cloning (npm runs the packaged `bin` straight from GitHub):
+Without cloning (npm runs the packaged `bin` straight from GitHub; npm 11+ needs `--allow-git=all` for git sources):
 
 ```bash
-npx --yes github:dillydalli3r/oh-my-pi-supreme-token-saver install --yes
+npx --yes --allow-git=all github:dillydalli3r/oh-my-pi-supreme-token-saver install --yes
 ```
 
 The installer copies the bundled extensions into `~/.omp/agent/extensions`, registers them in `~/.omp/agent/config.yml`, installs the Ponytail plugin (`github:DietrichGebert/ponytail`) and the RTK binary, and pins the Ponytail defaults above. `--dry-run` previews every write; `doctor` verifies the result afterwards.
@@ -32,7 +32,7 @@ The installer copies the bundled extensions into `~/.omp/agent/extensions`, regi
 
 Individual toggles: `/caveman ultra` · `/rtk on` · `/ponytail ultra`
 
-`update` re-runs the published installer from npm, so it needs this fork published under its own name first (`npm login` then `npm publish --access public`). Until then use `npx --yes github:dillydalli3r/oh-my-pi-supreme-token-saver install --yes` or `reinstall`.
+`update` re-runs the published installer from npm, so it needs this fork published under its own name first (`npm login` then `npm publish --access public`). Until then use `npx --yes --allow-git=all github:dillydalli3r/oh-my-pi-supreme-token-saver install --yes` or `reinstall`.
 
 ## What it installs
 
