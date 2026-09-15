@@ -462,6 +462,35 @@ test("changing only the row's shape keeps the preset the session reports", async
   assert.doesNotMatch(rt.notifications.at(-1).text, /custom/);
 });
 
+// One vocabulary for the rtk knob — the words `/ts set rtk=…` accepts, and no others. `enable` and
+// `disable` came from a local word list that used to live in the add-on, so accepting them again
+// would be a second vocabulary for one setting that the row and `/rtk status` would then have to
+// describe.
+test("the rtk knob accepts the same vocabulary /ts set rtk= does, and nothing else", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  await rt.run("rtk", "on");
+  assert.match(rt.row(), /🦀 rtk: ON/);
+
+  await rt.run("rtk", "off");
+  assert.match(rt.row(), /🦀 rtk: OFF/);
+
+  // `true`/`false` are the boolean spelling of the same two states, not a third vocabulary.
+  await rt.run("rtk", "true");
+  assert.match(rt.row(), /🦀 rtk: ON/);
+  await rt.run("rtk", "false");
+  assert.match(rt.row(), /🦀 rtk: OFF/);
+
+  const running = rt.row();
+  await rt.run("rtk", "enable");
+
+  const refused = rt.notifications.at(-1);
+  assert.equal(refused.type, "warning");
+  assert.match(refused.text, /Usage: \/rtk /);
+  assert.equal(rt.row(), running, "a word outside the vocabulary leaves the knob alone");
+});
+
 test("autoRtk off never spawns rtk and leaves the command alone", async () => {
   const rt = await createRuntime();
   await rt.start();
@@ -505,10 +534,15 @@ test("shell syntax, an existing rtk prefix and the exclude list all skip the sub
     throw new Error("this command must not be handed to rtk");
   });
 
+  // Every shape SHELL_SYNTAX refuses: a pipe, `;`, a redirection, `&&`, a newline (a command
+  // separator) and a substitution. A rewrite of any of them would drop what the shell was told to do
+  // with the output, so each has to reach the shell exactly as written.
   for (const command of [
     "cat notes.md | head -5",
-    "npm run build && npm run test",
     "ls; ls",
+    "git log > out.txt",
+    "npm run build && npm run test",
+    "git log --oneline\ngit status",
     "echo `date`",
     "echo $(date)",
     "rtk git status",
@@ -519,6 +553,16 @@ test("shell syntax, an existing rtk prefix and the exclude list all skip the sub
     assert.deepEqual(rt.execCalls, [], `no subprocess for ${command}`);
   }
 
+  // …and the shell syntax is the only reason those were skipped: a plain eligible command standing
+  // next to them is still rewritten.
+  rt.setExec(async (_command, args) =>
+    args.includes("rewrite") ? { code: 0, stdout: "rtk git diff HEAD~1", stderr: "" } : { code: 0, stdout: "", stderr: "" }
+  );
+  rt.clearExecCalls();
+  const [plain] = await rt.emit("tool_call", { toolName: "bash", input: { command: "git diff HEAD~1" } });
+  assert.deepEqual(plain, { input: { command: "rtk git diff HEAD~1" } });
+  assert.equal(rt.execCalls.length, 1, "the eligible command is the one handed to rtk");
+
   await rt.run("ts", 'option autoRtk.exclude=["git log"]');
   await rt.start();
 
@@ -526,6 +570,19 @@ test("shell syntax, an existing rtk prefix and the exclude list all skip the sub
   const [excluded] = await rt.emit("tool_call", { toolName: "bash", input: { command: "git log --all" } });
   assert.equal(excluded, undefined, "an excluded command is left alone");
   assert.deepEqual(rt.execCalls, []);
+});
+
+// A re-run after a compaction is handed back the prompt it already extended: appending the block
+// again would bill the same instructions twice for one turn.
+test("a compacted re-run does not append the rtk block a second time", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+
+  const first = await rt.runBeforeAgentStart("You are a helpful assistant.");
+  assert.equal(occurrences(first, "RTK mode active for this session"), 1);
+
+  const second = await rt.runBeforeAgentStart(first);
+  assert.equal(occurrences(second, "RTK mode active for this session"), 1, "the block is appended once per prompt");
 });
 
 test("the pack registers no context and no tool_result handler", async () => {
@@ -539,6 +596,26 @@ test("the pack registers no context and no tool_result handler", async () => {
     [],
     "the registered event map carries neither"
   );
+});
+
+// A reward key only counts on the final response: a turn that continues can still write it, so a key
+// seen mid-run must not spend the session's one notification.
+test("a reward key in a continued turn notifies nothing, and one in the final response does", async () => {
+  const rt = await createRuntime([], [join(EXT, "amanai-reward", "pi.js")]);
+  const finalResponse = (text) => ({
+    messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text }] }],
+  });
+  const key = "AMANAI-GACHA-ABC123-XY9";
+
+  await rt.emit("agent_start", {});
+  await rt.emit("agent_end", { willContinue: true, ...finalResponse(key) });
+  await rt.emit("agent_settled", {});
+  assert.deepEqual(rt.notifications, [], "a continued turn is not the final response");
+
+  await rt.emit("agent_end", finalResponse(key));
+  await rt.emit("agent_settled", {});
+  assert.equal(rt.notifications.length, 1);
+  assert.match(rt.notifications[0].text, /Amanai reward key/);
 });
 
 test("/ts native status renders the key table and a missing omp degrades to a warning", async () => {
@@ -720,6 +797,44 @@ test("a second session in one process does not republish over the live state", a
   await first.run("ts", "status");
   assert.match(first.notifications.at(-1).text, /Token Saver: CUSTOM/);
   assert.equal(second.row(), row, "the second session joins the state already running");
+});
+
+// The add-on's knob and the shared state are the same fact twice, so a turn where they already agree
+// has nothing to publish. Publishing the unchanged value anyway freezes and redraws the footer row a
+// second time in the same turn — token-saver's own `agent_start` is the write that already happened —
+// so the guard is exactly the difference between a turn that costs one row write and one that costs
+// two. Divergence is created by publishing straight into the shared state, the way the ponytail
+// plugin's own entries do: `/ts set` reloads the session, which resyncs this add-on's copy.
+test("the caveman add-on republishes the row only when its mode actually differs", async () => {
+  const { setSharedMode } = await import(pathToFileURL(join(EXT, "shared", "session-state.js")).href);
+  const rt = await createRuntime();
+  await rt.start();
+  await rt.run("caveman", "ultra");
+
+  const writes = [];
+  const setStatus = rt.ctx.ui.setStatus;
+  rt.ctx.ui.setStatus = (key, text) => {
+    writes.push(key);
+    setStatus(key, text);
+  };
+
+  // Agreed: the add-on's mode and the shared state are both ultra.
+  await rt.emit("agent_start", {});
+  const agreed = writes.length;
+
+  // A sibling moved the shared state under the add-on's feet: now its own mode really is news, and
+  // that one publish is the one extra row write.
+  setSharedMode("caveman", "lite");
+  writes.length = 0;
+  await rt.emit("agent_start", {});
+  const divergent = writes.length;
+
+  assert.equal(
+    divergent - agreed,
+    1,
+    `a divergent mode publishes once (${agreed} row writes with an agreed mode, ${divergent} with a divergent one)`
+  );
+  assert.deepEqual([...new Set(writes)], ["modes"], "there is still one row to redraw");
 });
 
 // Last: reads back every pi.exec call the whole file made. Nothing above may drive `omp config

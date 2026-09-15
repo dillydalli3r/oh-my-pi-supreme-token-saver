@@ -116,7 +116,9 @@ export default function cavemanSessionExtension(pi) {
   });
 
   pi.on("agent_start", async () => {
-    setSharedMode("caveman", currentMode);
+    // token-saver's own `agent_start` handler publishes the same state; only speak up when this
+    // add-on's knob would actually change, so one turn does not freeze and redraw the row twice.
+    if (getSharedState().caveman !== currentMode) setSharedMode("caveman", currentMode);
   });
 
   pi.on("before_agent_start", async (event) => {

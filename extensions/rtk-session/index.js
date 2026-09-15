@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   getSharedState,
   isOmpSubagentPrompt,
+  normalizeMode,
   readConfig,
   reconcileSharedEntries,
   setSharedMode,
@@ -12,11 +13,10 @@ const IS_WINDOWS = process.platform === "win32";
 const HOME = os.homedir();
 const RTK_BINARY = path.join(HOME, ".bun", "bin", IS_WINDOWS ? "rtk.exe" : "rtk");
 
-const ON_VALUES = new Set(["on", "enable", "enabled", "true"]);
-const OFF_VALUES = new Set(["off", "disable", "disabled", "false"]);
-
-// RTK refuses shell pipelines and substitutions anyway; skipping them here saves a subprocess.
-const SHELL_SYNTAX = /[|;`]|\$\(|&&/;
+// RTK refuses shell pipelines, redirections and substitutions anyway; skipping them here saves a
+// subprocess. `&` covers `&&`, and a newline is a command separator: a rewrite of either would drop
+// everything the shell was told to do with the output.
+const SHELL_SYNTAX = /[|;`&<>]|\$\(|\r?\n/;
 const ALREADY_RTK = /^rtk\s/;
 
 // Shell builtins are handled by the interpreter, never by a CLI binary, so RTK's registry can never
@@ -142,12 +142,10 @@ export default function rtkSessionExtension(pi) {
           ctx?.ui?.notify?.(`RTK auto-rewrite: ${autoRtk ? "on" : "off"}`, "info");
           return;
         }
-        if (ON_VALUES.has(rest)) {
-          setAutoRtk(true, ctx);
-          return;
-        }
-        if (OFF_VALUES.has(rest)) {
-          setAutoRtk(false, ctx);
+        // One vocabulary for the knob: the same words `/ts set autoRtk=…` accepts.
+        const autoValue = normalizeMode("autoRtk", rest);
+        if (autoValue) {
+          setAutoRtk(autoValue === "on", ctx);
           return;
         }
         ctx?.ui?.notify?.("Usage: /rtk auto [on|off|status]", "warning");
@@ -161,12 +159,9 @@ export default function rtkSessionExtension(pi) {
         await runGain(ctx);
         return;
       }
-      if (ON_VALUES.has(head)) {
-        setRtk(true, ctx);
-        return;
-      }
-      if (OFF_VALUES.has(head)) {
-        setRtk(false, ctx);
+      const value = normalizeMode("rtk", head);
+      if (value) {
+        setRtk(value === "on", ctx);
         return;
       }
       ctx?.ui?.notify?.("Usage: /rtk [on|off|status|gain] or /rtk auto [on|off|status]", "warning");
@@ -248,6 +243,9 @@ export default function rtkSessionExtension(pi) {
     const active = isOmpSubagentPrompt(event.systemPrompt) ? getSharedState().rtk === "on" : rtk;
     if (!active) return;
     const base = Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt];
+    // A re-run after a compaction hands back a prompt that already carries the block; appending it
+    // again would bill the same instructions twice.
+    if (base.some((prompt) => typeof prompt === "string" && prompt.includes(RTK_PROMPT))) return;
     return { systemPrompt: [...base, RTK_PROMPT] };
   });
 }

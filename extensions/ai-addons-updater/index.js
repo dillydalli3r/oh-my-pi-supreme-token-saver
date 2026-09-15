@@ -29,9 +29,11 @@ const RTK_BINARY = path.join(HOME, ".bun", "bin", IS_WINDOWS ? "rtk.exe" : "rtk"
 const CAVEMAN_REMOTE = "https://raw.githubusercontent.com/JuliusBrussee/caveman/main/src/rules/caveman-activate.md";
 const CAVEMAN_LOCAL = path.join(EXTENSIONS_DIR, "caveman-session", "rule.md");
 
-const TS_CONFIG = path.join(HOME, ".omp", "agent", "token-saver.json");
+// Same resolution as shared/session-state.js, so a session pointed at another file by
+// OMP_TOKEN_SAVER_CONFIG reports the preset it actually runs.
+const TS_CONFIG =
+  process.env.OMP_TOKEN_SAVER_CONFIG || path.join(HOME, ".omp", "agent", "token-saver.json");
 const TS_INDEX = path.join(EXTENSIONS_DIR, "token-saver", "index.js");
-const TS_PACKAGE_VERSION = path.join(EXTENSIONS_DIR, "package-version");
 const TS_COMMITS_API = "https://api.github.com/repos/dillydalli3r/oh-my-pi-supreme-token-saver/commits?per_page=1";
 const TS_GIT_SOURCE = "github:dillydalli3r/oh-my-pi-supreme-token-saver";
 const TS_NPM_SPEC = "@dillydalli3r/oh-my-pi-supreme-token-saver@latest";
@@ -49,6 +51,9 @@ function httpsGet(url, { maxRedirects = 5 } = {}) {
       }
       if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode} for ${url}`)); }
       let body = "";
+      // A reset mid-body errors the response stream, not just the request; unhandled, that event
+      // takes the whole process down.
+      res.on("error", reject);
       // ponytail: streamed accumulation — fine for tens of KB; stream-pipe if assets ever exceed a few MB.
       res.setEncoding("utf8");
       res.on("data", (chunk) => { body += chunk; });
@@ -72,7 +77,15 @@ function httpsDownload(url, dest, { maxRedirects = 5 } = {}) {
       const file = createWriteStream(dest);
       res.pipe(file);
       file.on("finish", () => file.close(() => resolve()));
-      file.on("error", reject);
+      // A reset mid-body errors the response stream, not the request: close the handle and drop the
+      // truncated archive, so a broken transfer cannot leave a partial file behind.
+      const fail = (error) => {
+        file.destroy();
+        fs.unlink(dest).catch(() => {});
+        reject(error);
+      };
+      res.on("error", fail);
+      file.on("error", fail);
     });
     req.on("error", reject);
     req.setTimeout(120000, () => req.destroy(new Error(`Timeout downloading ${url}`)));
@@ -119,9 +132,6 @@ async function checkTokenSaver() {
     try { preset = JSON.parse(configRaw).preset || null; } catch { preset = null; }
   }
 
-  const versionRaw = await readTextIfExists(TS_PACKAGE_VERSION);
-  const installed = versionRaw ? versionRaw.split(/\r?\n/)[0].trim() || null : null;
-
   let remoteDate = null;
   let remoteError = null;
   try {
@@ -129,79 +139,94 @@ async function checkTokenSaver() {
     remoteDate = JSON.parse(raw)?.[0]?.commit?.committer?.date?.slice(0, 10) || null;
   } catch (e) { remoteError = e.message; }
 
-  const suffix = `${preset ? ` preset=${preset}` : ""}${installed ? ` installed=${installed}` : ""}`;
+  const suffix = preset ? ` preset=${preset}` : "";
   const row = `Token saver (estimate): local ${localDate || "—"} · remote ${remoteDate || "—"}${suffix}`;
   return { row, remoteError };
 }
 
 // Check: no mutation.
 async function checkAddons(ctx) {
-  const lines = [];
+  // The four probes are independent network calls, so run them together — but the user sees them in
+  // this order, not in the order the hosts answered: each probe resolves to its own row plus the
+  // severity it decided, and the notifications go out in one pass below, over the settled results.
+  const results = await Promise.all([
+    // Ponytail
+    (async () => {
+      try {
+        const remoteRaw = await httpsGet(PONYTAIL_REMOTE);
+        const remoteJson = JSON.parse(remoteRaw);
+        const localRaw = await readTextIfExists(PONYTAIL_LOCAL);
+        const localVer = localRaw ? JSON.parse(localRaw).version : null;
+        const remoteVer = remoteJson.version;
+        const status = !localVer ? "not installed"
+          : localVer === remoteVer ? "up to date"
+          : "update available";
+        const text = `Ponytail ${status}: local=${localVer || "—"} latest=${remoteVer}`;
+        return { row: text, text, type: "info" };
+      } catch (e) {
+        const text = `Ponytail check failed: ${e.message}`;
+        return { row: text, text, type: "warning" };
+      }
+    })(),
 
-  // Ponytail
-  try {
-    const remoteRaw = await httpsGet(PONYTAIL_REMOTE);
-    const remoteJson = JSON.parse(remoteRaw);
-    const localRaw = await readTextIfExists(PONYTAIL_LOCAL);
-    const localVer = localRaw ? JSON.parse(localRaw).version : null;
-    const remoteVer = remoteJson.version;
-    const status = !localVer ? "not installed"
-      : localVer === remoteVer ? "up to date"
-      : "update available";
-    const m = `Ponytail ${status}: local=${localVer || "—"} latest=${remoteVer}`;
-    lines.push(m); notify(ctx, m, "info");
-  } catch (e) {
-    const m = `Ponytail check failed: ${e.message}`;
-    lines.push(m); notify(ctx, m, "warning");
-  }
+    // RTK
+    (async () => {
+      try {
+        const releaseRaw = await httpsGet(RTK_RELEASE_API);
+        const release = JSON.parse(releaseRaw);
+        const latestTag = release.tag_name || null;
+        let localVer = null;
+        try {
+          const out = execFileSync(RTK_BINARY, ["--version"], { encoding: "utf8", windowsHide: true, shell: false, timeout: 10000 }) || "";
+          if (out) localVer = out.trim().split(/\r?\n/)[0];
+        } catch { localVer = null; }
+        const status = localVer == null ? "not installed"
+          : normalizeRtkVersion(localVer) === normalizeRtkVersion(latestTag) ? "up to date"
+          : "update available";
+        const text = `RTK ${status}: local=${localVer || "—"} latest=${latestTag || "—"}`;
+        return { row: text, text, type: "info" };
+      } catch (e) {
+        const text = `RTK check failed: ${e.message}`;
+        return { row: text, text, type: "warning" };
+      }
+    })(),
 
-  // RTK
-  try {
-    const releaseRaw = await httpsGet(RTK_RELEASE_API);
-    const release = JSON.parse(releaseRaw);
-    const latestTag = release.tag_name || null;
-    let localVer = null;
-    try {
-      const out = execFileSync(RTK_BINARY, ["--version"], { encoding: "utf8", windowsHide: true, shell: false, timeout: 10000 }) || "";
-      if (out) localVer = out.trim().split(/\r?\n/)[0];
-    } catch { localVer = null; }
-    const status = localVer == null ? "not installed"
-      : normalizeRtkVersion(localVer) === normalizeRtkVersion(latestTag) ? "up to date"
-      : "update available";
-    const m = `RTK ${status}: local=${localVer || "—"} latest=${latestTag || "—"}`;
-    lines.push(m); notify(ctx, m, "info");
-  } catch (e) {
-    const m = `RTK check failed: ${e.message}`;
-    lines.push(m); notify(ctx, m, "warning");
-  }
+    // Caveman (rule.md)
+    (async () => {
+      try {
+        const remote = await httpsGet(CAVEMAN_REMOTE);
+        const remoteHash = sha256Hex(remote).slice(0, 16);
+        const local = await readTextIfExists(CAVEMAN_LOCAL);
+        const localHash = local ? sha256Hex(local).slice(0, 16) : null;
+        const status = !local ? "rule.md missing"
+          : localHash === remoteHash ? "rule.md up to date"
+          : "rule.md update available";
+        const text = `Caveman ${status}: local=${localHash || "—"} remote=${remoteHash}`;
+        return { row: text, text, type: "info" };
+      } catch (e) {
+        const text = `Caveman check failed: ${e.message}`;
+        return { row: text, text, type: "warning" };
+      }
+    })(),
 
-  // Caveman (rule.md)
-  try {
-    const remote = await httpsGet(CAVEMAN_REMOTE);
-    const remoteHash = sha256Hex(remote).slice(0, 16);
-    const local = await readTextIfExists(CAVEMAN_LOCAL);
-    const localHash = local ? sha256Hex(local).slice(0, 16) : null;
-    const status = !local ? "rule.md missing"
-      : localHash === remoteHash ? "rule.md up to date"
-      : "rule.md update available";
-    const m = `Caveman ${status}: local=${localHash || "—"} remote=${remoteHash}`;
-    lines.push(m); notify(ctx, m, "info");
-  } catch (e) {
-    const m = `Caveman check failed: ${e.message}`;
-    lines.push(m); notify(ctx, m, "warning");
-  }
+    // Token Saver pack (local date is an mtime guess; see note above)
+    (async () => {
+      try {
+        const { row, remoteError } = await checkTokenSaver();
+        // The failed remote lookup is a warning, but the row itself stays the bare estimate.
+        return remoteError
+          ? { row, text: `${row} (remote lookup failed: ${remoteError})`, type: "warning" }
+          : { row, text: row, type: "info" };
+      } catch (e) {
+        const text = `Token saver check failed: ${e.message}`;
+        return { row: text, text, type: "warning" };
+      }
+    })(),
+  ]);
 
-  // Token Saver pack (local date is an mtime guess; see note above)
-  try {
-    const { row, remoteError } = await checkTokenSaver();
-    lines.push(row);
-    notify(ctx, remoteError ? `${row} (remote lookup failed: ${remoteError})` : row, remoteError ? "warning" : "info");
-  } catch (e) {
-    const m = `Token saver check failed: ${e.message}`;
-    lines.push(m); notify(ctx, m, "warning");
-  }
+  for (const r of results) notify(ctx, r.text, r.type);
 
-  return lines.join("\n");
+  return results.map((r) => r.row).join("\n");
 }
 
 async function updatePonytail(pi, ctx, dryRun = false) {
@@ -223,7 +248,8 @@ async function updatePonytail(pi, ctx, dryRun = false) {
   let out = "";
   try {
     const [command, argv] = cliCommand("npm", ["install", "@dietrichgebert/ponytail@latest", "--save", "--no-audit", "--no-fund"]);
-    const r = await pi.exec(command, argv, { cwd: pluginsDir });
+    // A registry that never answers must not hang the command handler for the session's lifetime.
+    const r = await pi.exec(command, argv, { cwd: pluginsDir, timeout: 300000 });
     out = [r.stdout, r.stderr].filter(Boolean).join("\n").trim();
     if (r.code !== 0) throw new Error(r.stderr || `npm exited ${r.code}`);
   } catch (e) {
@@ -469,7 +495,8 @@ async function updateTokenSaver(pi, ctx, dryRun = false) {
     notify(ctx, `Token saver: running npx ${source.label} update…`, "info");
     try {
       const [command, argv] = cliCommand("npx", source.args);
-      const r = await pi.exec(command, argv);
+      // Same reason: a stalled npx (git source or registry) must not hold the handler open forever.
+      const r = await pi.exec(command, argv, { timeout: 300000 });
       const out = [r.stdout, r.stderr].filter(Boolean).join("\n").trim();
       if (r.code !== 0) throw new Error(r.stderr || `npx exited ${r.code}`);
       const m = `Token saver updated via ${source.label}.${out ? `\n${out}` : ""}\n${RELOAD_MSG}`;
@@ -533,5 +560,3 @@ export default function aiAddonsUpdaterExtension(pi) {
     },
   });
 }
-
-export { parseChecksum };

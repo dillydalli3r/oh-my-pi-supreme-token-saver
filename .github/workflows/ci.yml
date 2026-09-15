@@ -23,8 +23,8 @@ jobs:
       - name: Syntax check
         run: npm run check
       - name: Tests
-        run: node --test
+        run: npm test
       - name: Installer is offline-safe
         # A dry run must be a pure preview: no network, no writes. It is the guard against an
         # installer that quietly needs GitHub to be reachable just to print what it would do.
-        run: node install-omp-addons.js --dry-run --scope user --yes
+        run: npm run dry-run

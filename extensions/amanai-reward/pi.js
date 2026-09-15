@@ -10,6 +10,8 @@ export default function amanaiRewardExtension(pi) {
 
   pi.on("agent_end", (event) => {
     candidate = false;
+    // A continuation is not the final response; the key may still be written on the next turn.
+    if (event?.willContinue) return;
 
     const messages = Array.isArray(event?.messages) ? event.messages : [];
     let message;
@@ -28,7 +30,7 @@ export default function amanaiRewardExtension(pi) {
 
   pi.on("agent_settled", (_event, ctx) => {
     try {
-      candidate && ctx.hasUI && ctx.ui.notify(NOTIFICATION, "info");
+      if (candidate) ctx?.ui?.notify?.(NOTIFICATION, "info");
     } finally {
       candidate = false;
     }
