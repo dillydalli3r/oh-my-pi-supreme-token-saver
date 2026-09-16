@@ -273,9 +273,14 @@ reported as `unknown` when none does:
 
 | # | Source | Layout |
 |---|---|---|
-| 1 | `<extensions>/.omp-token-saver-version` (the stamp an install writes; JSON or a bare version) | either |
+| 1 | `<extensions>/.omp-token-saver-version` — a stamp written into the installed tree (JSON `{"version": …}` or a bare version). Honoured when it is there; the installer does not write one today | either |
 | 2 | `<plugins>/omp-plugins.lock.json` → `plugins["@dillydalli3r/omp-supreme-token-saver"].version` | plugin |
 | 3 | the `package.json` the module travels with | plugin, or a repo checkout |
+
+A legacy-only install therefore reports `version unknown` — nothing stamps that tree and there is no
+`package.json` beside those modules — which is the honest answer, and never a nag: an unknown version
+is not an update. Installing the pack as a marketplace plugin (or running it from a checkout) makes the
+row readable.
 
 Every path the updater resolves is derived from its own module URL, so it runs unchanged from
 `~/.omp/agent/extensions/…` and from `~/.omp/plugins/node_modules/…`: the caveman rule and the
@@ -701,9 +706,10 @@ entirely, and deleting `~/.omp/agent/ai-addons-state.json` forces the next sessi
 
 The check could not find a version for the installed pack: no `<extensions>/.omp-token-saver-version`
 stamp, no `omp-plugins.lock.json` entry and no `package.json` beside the modules — the exact situation
-of a legacy install the installer has never stamped. It reports `unknown` rather than guessing from a
-file's mtime. Reinstalling (which writes the stamp) or installing the pack as a marketplace plugin
-both make the row readable again.
+of a legacy install, which nothing stamps. It reports `unknown` rather than guessing from a file's
+mtime, and an unknown version never counts as an update, so the row is quiet about it. Installing the
+pack as a marketplace plugin puts its `package.json` beside the modules and makes the row readable
+again.
 
 ### `/combo` is missing after upgrading
 
