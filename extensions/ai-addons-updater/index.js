@@ -1,42 +1,63 @@
-// OMP extension: /ai-addons manual updater for Ponytail, RTK, Caveman, Token Saver.
-// Built-in Node modules only. Default off; registers a single slash command.
+// OMP extension: /ai-addons — version check, startup update notice and manual updater for Ponytail,
+// RTK, Caveman and this pack. Built-in Node modules only.
 // ponytail: `skipped: none` — semantics match one-liner: fetch + compare + run install.
 // rtk: `skipped: signature verification` — checksums.txt ships only SHA256 of release assets; add sigchain when upstream publishes a signing key.
 // caveman: `skipped: none` — exactly the ask: write rule.md, report old/new hash.
 // tokensaver: `skipped: direct writes` — the pack owns its own installer, we only spawn it.
+// startup: `skipped: backoff` — a fixed interval, not an exponential one; the notice is one line per interval.
 
 import https from "node:https";
 import { createHash } from "node:crypto";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, existsSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { foreignLevels, nativeGapHint, readConfig, readOptions } from "../shared/session-state.js";
 
 const IS_WINDOWS = process.platform === "win32";
 const HOME = os.homedir();
 
-// Installed layout (v2): each extension is a directory under ~/.omp/agent/extensions
-// (caveman-session, rtk-session, token-saver, ai-addons-updater), shared modules live in
-// extensions/shared (session-state.js, status-line.js, mode-reinforcement.js). This updater never
-// writes inside them — the pack's own installer owns that.
-const EXTENSIONS_DIR = path.join(HOME, ".omp", "agent", "extensions");
+// The pack can be installed two ways and nothing here may assume either one. Both layouts put every
+// module in one `extensions/` directory, so this module's own URL locates the tree and every sibling
+// follows from there:
+//   legacy: ~/.omp/agent/extensions/<module>/index.js            (the installer's copies)
+//   plugin: <plugins>/node_modules/@dillydalli3r/omp-supreme-token-saver/extensions/<module>/index.js
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const EXTENSIONS_DIR = path.resolve(MODULE_DIR, "..");
+const PACK_ROOT = path.resolve(EXTENSIONS_DIR, "..");
+
+const PACKAGE_NAME = "@dillydalli3r/omp-supreme-token-saver";
+const PACKAGE_REPO = "dillydalli3r/omp-supreme-token-saver";
 
 const PONYTAIL_REMOTE = "https://raw.githubusercontent.com/DietrichGebert/ponytail/main/package.json";
-const PONYTAIL_LOCAL = path.join(HOME, ".omp", "plugins", "node_modules", "@dietrichgebert", "ponytail", "package.json");
+const PONYTAIL_DIR = ["@dietrichgebert", "ponytail"];
 const RTK_RELEASE_API = "https://api.github.com/repos/rtk-ai/rtk/releases/latest";
 const RTK_BINARY = path.join(HOME, ".bun", "bin", IS_WINDOWS ? "rtk.exe" : "rtk");
 const CAVEMAN_REMOTE = "https://raw.githubusercontent.com/JuliusBrussee/caveman/main/src/rules/caveman-activate.md";
 const CAVEMAN_LOCAL = path.join(EXTENSIONS_DIR, "caveman-session", "rule.md");
 
+// The published manifest is the version the next install would land on, raw-fetched: no rate limit, no
+// auth, and no token needed on a machine that has never run `gh auth login`. The npm registry is
+// checked beside it for when the package is republished there.
+const PACK_MANIFEST_REMOTE = `https://raw.githubusercontent.com/${PACKAGE_REPO}/main/package.json`;
+const PACK_NPM_LATEST = `https://registry.npmjs.org/${PACKAGE_NAME.replace("/", "%2F")}/latest`;
+const PACK_GIT_SOURCE = `github:${PACKAGE_REPO}`;
+const PACK_NPM_SPEC = `${PACKAGE_NAME}@latest`;
+
 // Same resolution as shared/session-state.js, so a session pointed at another file by
-// OMP_TOKEN_SAVER_CONFIG reports the preset it actually runs.
+// OMP_TOKEN_SAVER_CONFIG checks the pack it actually runs. This extension's own files sit beside it.
 const TS_CONFIG =
   process.env.OMP_TOKEN_SAVER_CONFIG || path.join(HOME, ".omp", "agent", "token-saver.json");
-const TS_INDEX = path.join(EXTENSIONS_DIR, "token-saver", "index.js");
-const TS_COMMITS_API = "https://api.github.com/repos/dillydalli3r/oh-my-pi-supreme-token-saver/commits?per_page=1";
-const TS_GIT_SOURCE = "github:dillydalli3r/oh-my-pi-supreme-token-saver";
-const TS_NPM_SPEC = "@dillydalli3r/oh-my-pi-supreme-token-saver@latest";
+const CONFIG_PATH = path.join(path.dirname(TS_CONFIG), "ai-addons.json");
+const STATE_PATH = path.join(path.dirname(TS_CONFIG), "ai-addons-state.json");
+const DEFAULT_STARTUP = { checkOnStart: true, intervalHours: 6 };
+
+// Version stamp the installer may drop into the installed tree (README: "Version sources"). Absent is
+// normal — the marketplace lock file and the pack's own package.json answer for the plugin layout.
+const VERSION_STAMP =
+  process.env.OMP_TOKEN_SAVER_VERSION_STAMP || path.join(EXTENSIONS_DIR, ".omp-token-saver-version");
 
 const RELOAD_MSG = "Reminder: restart OMP (or reload extensions) for updates to take effect.";
 
@@ -117,116 +138,279 @@ function notify(ctx, msg, level) {
   ctx?.ui?.notify?.(String(msg), level || "info");
 }
 
-// The pack ships no version into the installed tree, so the row guesses from the index.js mtime.
-// Local-vs-remote dates are only a hint: this repo publishes straight from GitHub, so a date gap
-// signals probable staleness, not proof — run `/ai-addons update tokensaver` to be sure.
-async function checkTokenSaver() {
-  let localDate = null;
-  try {
-    localDate = new Date((await fs.stat(TS_INDEX)).mtime).toISOString().slice(0, 10);
-  } catch { localDate = null; }
+// --- paths -------------------------------------------------------------------------------------
 
-  let preset = null;
-  const configRaw = await readTextIfExists(TS_CONFIG);
-  if (configRaw) {
-    try { preset = JSON.parse(configRaw).preset || null; } catch { preset = null; }
+// Marketplace state moves under $XDG_DATA_HOME/omp once that root exists; the non-XDG default is
+// ~/.omp. Whichever root is present on disk is the one omp actually uses.
+function pluginsRoot() {
+  const xdg = process.env.XDG_DATA_HOME;
+  if (xdg) {
+    const candidate = path.join(xdg, "omp", "plugins");
+    if (existsSync(candidate)) return candidate;
   }
+  return path.join(HOME, ".omp", "plugins");
+}
 
-  let remoteDate = null;
+function ponytailManifest() {
+  return path.join(pluginsRoot(), "node_modules", ...PONYTAIL_DIR, "package.json");
+}
+
+async function readJsonFile(file) {
+  try { return JSON.parse(await fs.readFile(file, "utf8")); } catch { return null; }
+}
+
+async function writeJsonFile(file, value) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+// --- versions ----------------------------------------------------------------------------------
+
+const FETCH_TIMEOUT_MS = 6000;
+
+// `fetch` (not https.get) for everything a check reads: one URL per call, a hard timeout, and a stub a
+// test can swap in. Downloads still stream through httpsDownload — those write files.
+async function fetchWithTimeout(url, accept) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { "user-agent": "omp-ai-addons-updater", accept },
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchJson(url) {
+  return (await fetchWithTimeout(url, "application/json,*/*")).json();
+}
+
+async function fetchText(url) {
+  return (await fetchWithTimeout(url, "text/plain,*/*")).text();
+}
+
+// Semver-ish over the dotted numeric parts, ignoring a leading `v` and any pre-release suffix. This pack
+// publishes plain x.y.z, where this agrees with semver exactly.
+function cmpVersion(a, b) {
+  const parse = (value) =>
+    String(value).replace(/^v/i, "").split("-")[0].split(".").map((part) => Number.parseInt(part, 10) || 0);
+  const left = parse(a);
+  const right = parse(b);
+  for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
+    const l = left[i] || 0;
+    const r = right[i] || 0;
+    if (l !== r) return l < r ? -1 : 1;
+  }
+  return 0;
+}
+
+// The stamp is either `{"version":"2.2.0"}` or a bare `2.2.0`; anything else is not a version.
+function stampVersion(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return null;
+  if (!trimmed.startsWith("{")) return trimmed.split(/\s+/)[0];
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed?.version ? String(parsed.version) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Where the installed pack's version comes from, most specific first:
+//   1. the stamp a legacy install wrote into the tree (the installer owns writing it),
+//   2. the marketplace lock file — what omp believes is installed,
+//   3. the package.json the module travels with (plugin layout, or a repo checkout).
+// Nothing else is reported as a version: an mtime reads as a date, and a date reads as proof of a
+// version this row cannot actually see, so an unreachable source is `unknown` instead.
+async function readPackVersion() {
+  const stamped = stampVersion(await readTextIfExists(VERSION_STAMP));
+  if (stamped) return { version: stamped, source: "stamp" };
+
+  const lock = await readJsonFile(path.join(pluginsRoot(), "omp-plugins.lock.json"));
+  const locked = lock?.plugins?.[PACKAGE_NAME]?.version;
+  if (locked) return { version: String(locked), source: "omp-plugins.lock.json" };
+
+  for (const manifest of [
+    path.join(pluginsRoot(), "node_modules", ...PACKAGE_NAME.split("/"), "package.json"),
+    path.join(PACK_ROOT, "package.json"),
+  ]) {
+    const version = (await readJsonFile(manifest))?.version;
+    if (version) return { version: String(version), source: "package.json" };
+  }
+  return { version: null, source: null };
+}
+
+// Version check for this pack. No mutation.
+async function checkTokenSaver() {
+  const local = await readPackVersion();
+  const preset = readConfig().preset;
+
+  let remote = null;
   let remoteError = null;
   try {
-    const raw = await httpsGet(TS_COMMITS_API);
-    remoteDate = JSON.parse(raw)?.[0]?.commit?.committer?.date?.slice(0, 10) || null;
+    remote = (await fetchJson(PACK_MANIFEST_REMOTE))?.version ?? null;
   } catch (e) { remoteError = e.message; }
 
-  const suffix = preset ? ` preset=${preset}` : "";
-  const row = `Token saver (estimate): local ${localDate || "—"} · remote ${remoteDate || "—"}${suffix}`;
-  return { row, remoteError };
+  // The registry is a second publisher of the same package: reported when it answers, silent when it
+  // 404s (this fork is published from GitHub today).
+  let published = null;
+  try {
+    published = (await fetchJson(PACK_NPM_LATEST))?.version ?? null;
+  } catch { published = null; }
+
+  const newest = remote && published && cmpVersion(published, remote) > 0 ? published : remote;
+  const update = Boolean(local.version && newest && cmpVersion(newest, local.version) > 0);
+  const status = !local.version ? "version unknown"
+    : !newest ? "version unknown (no published manifest)"
+    : update ? `update available → ${newest}`
+    : "up to date";
+  const localText = local.version
+    ? `${local.version} (${local.source})`
+    : `unknown — no ${path.basename(VERSION_STAMP)}, no lock entry, no package.json`;
+  const row = `Token saver ${status}: local=${localText} · published=${remote || "—"}` +
+    `${published ? ` · npm=${published}` : ""} · preset=${preset}`;
+  return {
+    id: "tokensaver",
+    local: local.version || "unknown",
+    remote: newest || "unknown",
+    update,
+    row,
+    text: remoteError ? `${row} (manifest lookup failed: ${remoteError})` : row,
+    type: remoteError ? "warning" : "info",
+  };
+}
+
+// Ponytail: version from the plugin's own manifest, wherever the plugin root resolves to.
+async function checkPonytail() {
+  const manifest = ponytailManifest();
+  try {
+    const remote = (await fetchJson(PONYTAIL_REMOTE))?.version ?? null;
+    const local = (await readJsonFile(manifest))?.version ?? null;
+    const update = Boolean(local && remote && cmpVersion(remote, local) > 0);
+    const status = !local ? `not installed — no manifest at ${manifest}`
+      : update ? "update available"
+      : cmpVersion(remote, local) === 0 ? "up to date"
+      : "ahead of the published version";
+    const row = `Ponytail ${status}: local=${local || "—"} latest=${remote || "—"}`;
+    return { id: "ponytail", local, remote, update, row, text: row, type: "info" };
+  } catch (e) {
+    const text = `Ponytail check failed: ${e.message}`;
+    return { id: "ponytail", local: null, remote: null, update: false, row: text, text, type: "warning" };
+  }
+}
+
+// RTK: the binary is not the pack's, so a path that holds nothing is reported as such rather than
+// spawned.
+async function checkRtk() {
+  if (!existsSync(RTK_BINARY)) {
+    const row = `RTK not installed: no binary at ${RTK_BINARY}`;
+    return { id: "rtk", local: null, remote: null, update: false, row, text: row, type: "info" };
+  }
+  try {
+    const latest = (await fetchJson(RTK_RELEASE_API))?.tag_name || null;
+    let localVer = null;
+    try {
+      const out = execFileSync(RTK_BINARY, ["--version"], { encoding: "utf8", windowsHide: true, shell: false, timeout: 10000 }) || "";
+      if (out) localVer = normalizeRtkVersion(out.trim().split(/\r?\n/)[0]);
+    } catch { localVer = null; }
+    const update = Boolean(localVer && latest && cmpVersion(normalizeRtkVersion(latest), localVer) > 0);
+    const status = localVer == null ? "installed but not runnable"
+      : update ? "update available"
+      : "up to date";
+    const row = `RTK ${status}: local=${localVer || "—"} latest=${latest || "—"}`;
+    return { id: "rtk", local: localVer, remote: latest, update, row, text: row, type: "info" };
+  } catch (e) {
+    const text = `RTK check failed: ${e.message}`;
+    return { id: "rtk", local: null, remote: null, update: false, row: text, text, type: "warning" };
+  }
+}
+
+// Caveman rule.md, next to this module in either layout. The upstream text names levels `/caveman` here
+// rejects, and the extension serves its own bundled rule when the installed file does — so an upstream
+// copy that names one is not an update this pack can adopt: adopting it changes nothing a session sees.
+async function checkCaveman() {
+  try {
+    const remote = await fetchText(CAVEMAN_REMOTE);
+    const local = await readTextIfExists(CAVEMAN_LOCAL);
+    const foreign = foreignLevels(remote);
+    if (foreign.length) {
+      const row = `Caveman rule: serving the bundled rule — the published rule names ` +
+        `${foreign.join(", ")}, which /caveman rejects`;
+      return { id: "caveman", local: "bundled", remote: "rejected", update: false, row, text: row, type: "info" };
+    }
+    const remoteHash = sha256Hex(remote).slice(0, 16);
+    const localHash = local ? sha256Hex(local).slice(0, 16) : "—";
+    const update = !local || localHash !== remoteHash;
+    const status = !local ? `rule.md missing at ${CAVEMAN_LOCAL}`
+      : update ? "rule.md update available"
+      : "rule.md up to date";
+    const text = `Caveman ${status}: local=${localHash} remote=${remoteHash}`;
+    return { id: "caveman", local: localHash, remote: remoteHash, update, row: text, text, type: "info" };
+  } catch (e) {
+    const text = `Caveman check failed: ${e.message}`;
+    return { id: "caveman", local: null, remote: null, update: false, row: text, text, type: "warning" };
+  }
 }
 
 // Check: no mutation.
+async function collectChecks() {
+  // The four probes are independent network calls, so run them together — but the user sees them in this
+  // order, not in the order the hosts answered.
+  return Promise.all([checkPonytail(), checkRtk(), checkCaveman(), checkTokenSaver()]);
+}
+
 async function checkAddons(ctx) {
-  // The four probes are independent network calls, so run them together — but the user sees them in
-  // this order, not in the order the hosts answered: each probe resolves to its own row plus the
-  // severity it decided, and the notifications go out in one pass below, over the settled results.
-  const results = await Promise.all([
-    // Ponytail
-    (async () => {
-      try {
-        const remoteRaw = await httpsGet(PONYTAIL_REMOTE);
-        const remoteJson = JSON.parse(remoteRaw);
-        const localRaw = await readTextIfExists(PONYTAIL_LOCAL);
-        const localVer = localRaw ? JSON.parse(localRaw).version : null;
-        const remoteVer = remoteJson.version;
-        const status = !localVer ? "not installed"
-          : localVer === remoteVer ? "up to date"
-          : "update available";
-        const text = `Ponytail ${status}: local=${localVer || "—"} latest=${remoteVer}`;
-        return { row: text, text, type: "info" };
-      } catch (e) {
-        const text = `Ponytail check failed: ${e.message}`;
-        return { row: text, text, type: "warning" };
-      }
-    })(),
+  const rows = await collectChecks();
+  for (const row of rows) notify(ctx, row.text, row.type);
+  return rows.map((row) => row.row).join("\n");
+}
 
-    // RTK
-    (async () => {
-      try {
-        const releaseRaw = await httpsGet(RTK_RELEASE_API);
-        const release = JSON.parse(releaseRaw);
-        const latestTag = release.tag_name || null;
-        let localVer = null;
-        try {
-          const out = execFileSync(RTK_BINARY, ["--version"], { encoding: "utf8", windowsHide: true, shell: false, timeout: 10000 }) || "";
-          if (out) localVer = out.trim().split(/\r?\n/)[0];
-        } catch { localVer = null; }
-        const status = localVer == null ? "not installed"
-          : normalizeRtkVersion(localVer) === normalizeRtkVersion(latestTag) ? "up to date"
-          : "update available";
-        const text = `RTK ${status}: local=${localVer || "—"} latest=${latestTag || "—"}`;
-        return { row: text, text, type: "info" };
-      } catch (e) {
-        const text = `RTK check failed: ${e.message}`;
-        return { row: text, text, type: "warning" };
-      }
-    })(),
+// --- startup check -----------------------------------------------------------------------------
 
-    // Caveman (rule.md)
-    (async () => {
-      try {
-        const remote = await httpsGet(CAVEMAN_REMOTE);
-        const remoteHash = sha256Hex(remote).slice(0, 16);
-        const local = await readTextIfExists(CAVEMAN_LOCAL);
-        const localHash = local ? sha256Hex(local).slice(0, 16) : null;
-        const status = !local ? "rule.md missing"
-          : localHash === remoteHash ? "rule.md up to date"
-          : "rule.md update available";
-        const text = `Caveman ${status}: local=${localHash || "—"} remote=${remoteHash}`;
-        return { row: text, text, type: "info" };
-      } catch (e) {
-        const text = `Caveman check failed: ${e.message}`;
-        return { row: text, text, type: "warning" };
-      }
-    })(),
+async function loadStartupConfig() {
+  const raw = (await readJsonFile(CONFIG_PATH)) || {};
+  return {
+    checkOnStart: raw.checkOnStart !== false,
+    intervalHours: Number.isFinite(raw.intervalHours) && raw.intervalHours > 0
+      ? raw.intervalHours
+      : DEFAULT_STARTUP.intervalHours,
+  };
+}
 
-    // Token Saver pack (local date is an mtime guess; see note above)
-    (async () => {
-      try {
-        const { row, remoteError } = await checkTokenSaver();
-        // The failed remote lookup is a warning, but the row itself stays the bare estimate.
-        return remoteError
-          ? { row, text: `${row} (remote lookup failed: ${remoteError})`, type: "warning" }
-          : { row, text: row, type: "info" };
-      } catch (e) {
-        const text = `Token saver check failed: ${e.message}`;
-        return { row: text, text, type: "warning" };
-      }
-    })(),
-  ]);
+// Startup runs off the turn and at most once per interval. Two layers keep it quiet: `lastCheck` gates
+// the network, and `notified` remembers the signature of what was announced, so a restarted session does
+// not repeat a nag no new release stands behind.
+async function runStartupCheck(ctx) {
+  const config = await loadStartupConfig();
+  if (!config.checkOnStart) return;
 
-  for (const r of results) notify(ctx, r.text, r.type);
+  const state = (await readJsonFile(STATE_PATH)) || {};
+  if (Date.now() - (Number(state.lastCheck) || 0) < config.intervalHours * 3600_000) return;
+  // The timestamp is written before the fetch: a machine that is offline at every start must not
+  // re-attempt the whole set on every session.
+  await writeJsonFile(STATE_PATH, { ...state, lastCheck: Date.now() });
 
-  return results.map((r) => r.row).join("\n");
+  const rows = await collectChecks();
+  const stale = rows.filter((row) => row.update);
+  const signature = stale.map((row) => `${row.id} ${row.local}→${row.remote}`).join("|");
+  if (stale.length && state.notified === signature) return;
+
+  const lines = [];
+  if (stale.length) {
+    const count = `${stale.length} update${stale.length === 1 ? "" : "s"}`;
+    lines.push(`${count}: ${stale.map((row) => `${row.id} ${row.local} → ${row.remote}`).join(", ")}` +
+      ` — run ${stale.map((row) => `/ai-addons update ${row.id}`).join(" | ")}`);
+  }
+  const hint = nativeGapHint(readConfig().preset, readOptions().native.mode);
+  if (hint) lines.push(hint);
+
+  await writeJsonFile(STATE_PATH, { lastCheck: Date.now(), notified: signature });
+  if (lines.length) notify(ctx, `ai-addons: ${lines.join(" · ")}`, stale.length ? "warning" : "info");
 }
 
 async function updatePonytail(pi, ctx, dryRun = false) {
@@ -434,6 +618,16 @@ async function updateCaveman(ctx, dryRun = false) {
   try { remote = await httpsGet(CAVEMAN_REMOTE); }
   catch (e) { const m = `Caveman update failed: ${e.message}`; notify(ctx, m, "warning"); return m; }
 
+  // Writing a rule that names a level `/caveman` rejects would change the file and nothing a session
+  // sees — caveman-session serves its bundled copy instead. Refuse loudly rather than churn the file.
+  const foreign = foreignLevels(remote);
+  if (foreign.length) {
+    const m = `Caveman rule not updated: the published rule names ${foreign.join(", ")}, which /caveman rejects ` +
+      `— the pack keeps serving its bundled rule (${CAVEMAN_LOCAL} unchanged).`;
+    notify(ctx, m, "warning");
+    return m;
+  }
+
   const remoteHash = sha256Hex(remote).slice(0, 16);
   const oldLocal = await readTextIfExists(CAVEMAN_LOCAL);
   const oldHash = oldLocal ? sha256Hex(oldLocal).slice(0, 16) : null;
@@ -475,11 +669,11 @@ function cliCommand(name, args) {
 
 // Same path the installer uses: npx runs the pack's own `update`. GitHub source first (the fork
 // publishes from there), npm package as the fallback once it is published. Writes never happen here
-// — the installer owns ~/.omp/agent/extensions/token-saver/.
+// — the pack's installer owns the extensions tree.
 function tokenSaverSources() {
   return [
-    { label: TS_GIT_SOURCE, args: ["--yes", "--allow-git=all", TS_GIT_SOURCE, "update", "--yes"] },
-    { label: TS_NPM_SPEC, args: ["--yes", TS_NPM_SPEC, "update", "--yes"] },
+    { label: PACK_GIT_SOURCE, args: ["--yes", "--allow-git=all", PACK_GIT_SOURCE, "update", "--yes"] },
+    { label: PACK_NPM_SPEC, args: ["--yes", PACK_NPM_SPEC, "update", "--yes"] },
   ];
 }
 
@@ -514,8 +708,10 @@ async function updateTokenSaver(pi, ctx, dryRun = false) {
 export default function aiAddonsUpdaterExtension(pi) {
   pi.setLabel?.("AI add-ons updater");
 
+  const USAGE = "/ai-addons <check|status|update ponytail|rtk|caveman|tokensaver|all|level on|off> [--dry-run]";
+
   pi.registerCommand("ai-addons", {
-    description: "Check or update AI add-ons (ponytail/rtk/caveman/tokensaver/all). Usage: /ai-addons <check|status|update ponytail|rtk|caveman|tokensaver|all> [--dry-run]",
+    description: "Check or update AI add-ons (ponytail/rtk/caveman/tokensaver/all) and the startup notice. Usage: " + USAGE,
     handler: async (args, ctx) => {
       const arg = String(args || "").trim().toLowerCase();
       const parts = arg.split(/\s+/).filter(Boolean);
@@ -527,6 +723,21 @@ export default function aiAddonsUpdaterExtension(pi) {
         const summary = await checkAddons(ctx);
         notify(ctx, "ai-addons check complete.", "info");
         return summary;
+      }
+      // The startup notice is a stored preference like the suite's `/omp-addons level`: `off` stops the
+      // session-start check without removing the command.
+      if (sub === "level") {
+        if (cleanParts[1] === "on" || cleanParts[1] === "off") {
+          await writeJsonFile(CONFIG_PATH, {
+            ...((await readJsonFile(CONFIG_PATH)) || {}),
+            checkOnStart: cleanParts[1] === "on",
+          });
+        }
+        const config = await loadStartupConfig();
+        const m = `ai-addons: startup check ${config.checkOnStart ? "on" : "off"}, ` +
+          `every ${config.intervalHours}h (${CONFIG_PATH})`;
+        notify(ctx, m, "info");
+        return m;
       }
       if (sub === "update" && cleanParts[1]) {
         const target = cleanParts.slice(1).join(" ");
@@ -554,9 +765,13 @@ export default function aiAddonsUpdaterExtension(pi) {
         return results.join("\n\n");
       }
 
-      const m = "Usage: /ai-addons <check|status|update ponytail|rtk|caveman|tokensaver|all> [--dry-run]";
-      notify(ctx, m, "warning");
-      return m;
+      notify(ctx, `Usage: ${USAGE}`, "warning");
+      return USAGE;
     },
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    // Fire and forget: the handler resolves immediately, so startup is never gated on GitHub.
+    runStartupCheck(ctx).catch(() => {});
   });
 }

@@ -1,17 +1,17 @@
 // One status key => one footer row for every Supreme Token Saver add-on:
-//   🧩 MAX · 🦴U 🦀ON 🔁ON 🐴U · 📖F 🗜️F 🧹F ⏱️70% · 🔀OFF
+//   🧩 MAX · caveman ultra · rtk on · … · threshold full (70%) · headroom off
 //
 // Every add-on publishes into the shared state in ./session-state.js; this module is the only writer
 // of extension status, so a knob's symbol never depends on how the value was set (/ts, a per-app
 // command, or the session default). Rendering is display-only: nothing here changes a mode.
 //
-// The row is a footer, so it is built to fit one. A knob is an icon and a value, never `icon name:
-// VALUE`: the preset already names the session, so a label beside every icon repeats what the icon
-// says. Knobs that configure the same layer are spaced together into one group (the prompt add-ons,
-// the four OMP settings, the extras), and groups are what the ` · ` separators divide. The spelled-out
-// shape is `names`, one `/ts set status=names` away; `/ts status` prints every knob in full.
+// The row is a footer, so it has two shapes for two footers. `names` (the default) spells every knob
+// out — its real name and its level, the words `/ts set` takes — and `full` pays one icon and one
+// letter per knob instead, grouping by the layer each knob configures (the prompt add-ons, the four
+// OMP settings, the extras) with those groups as what the ` · ` separators divide. `/ts status` prints
+// every knob in full whichever shape the row is on.
 
-import { MODE_KNOBS } from "./session-state.js";
+import { MODE_KNOBS, THRESHOLD_PERCENT, readOptions, resolveThreshold, sessionContextWindow } from "./session-state.js";
 
 const STATUS_KEY = "modes";
 
@@ -66,16 +66,16 @@ function buildGroups() {
 // which one is set.
 const ON_OFF = Object.freeze(["rtk", "autoRtk", "headroom"]);
 
-// The number behind a `threshold` level: `compaction.thresholdPercent`, the share of the context
-// window at or above which OMP compacts (the level table lives in ../token-saver/index.js, and a test
-// pins these against the percent each level writes). `off` is the host's own `-1`, whose limit is the
-// reserve — a 16k floor and 15% of the window — rather than a share.
-const THRESHOLD = Object.freeze({
-  off: Object.freeze({ short: "res", long: "reserve" }),
-  lite: Object.freeze({ short: "85%", long: "85%" }),
-  full: Object.freeze({ short: "70%", long: "70%" }),
-  ultra: Object.freeze({ short: "55%", long: "55%" }),
-});
+// The number in a `threshold` token's place: the limit the pack actually writes, resolved by the
+// same function the native writer uses, so the row can never claim a limit the `compaction.*` keys
+// disagree with. The level's share lives in session-state.js (one copy, two readers); a pinned share
+// or cap (`options.threshold`) outranks it, and `auto` shows whichever one fires first. `off` leaves
+// the host's reserve — `res` says so rather than inventing a number for it.
+function thresholdNote(level, ctx, spelled = false) {
+  const limits = resolveThreshold(readOptions().threshold, THRESHOLD_PERCENT[level] ?? -1, sessionContextWindow(ctx));
+  if (limits.tokens > 0) return limits.tokens >= 1000 ? `${Math.round(limits.tokens / 1000)}k` : String(limits.tokens);
+  return limits.percent > 0 ? `${limits.percent}%` : spelled ? "reserve" : "res";
+}
 
 function knobValue(value) {
   return String(value || "off").toUpperCase();
@@ -91,11 +91,11 @@ function marker(name) {
 // (the levels are listed in KNOBS and in `/ts status`); `threshold` shows the number instead of the
 // letter, because the letter is only a stand-in for that number and the footer has room for exactly
 // one of them.
-function shortToken(name, value) {
+function shortToken(name, value, ctx) {
   const body = ON_OFF.includes(name)
     ? knobValue(value)
     : name === "threshold"
-      ? THRESHOLD[value]?.short || knobValue(value).slice(0, 1)
+      ? thresholdNote(value, ctx)
       : knobValue(value).slice(0, 1);
   const glyph = marker(name);
   return glyph ? `${glyph}${body}` : `${name} ${body}`;
@@ -105,8 +105,8 @@ function shortToken(name, value) {
 // for it) and its level in the lowercase the commands use, so the row and the vocabulary are one
 // vocabulary. `threshold` carries the share too: the level word does not say the number, and this is
 // the shape with room for both.
-function longToken(name, value) {
-  const share = name === "threshold" ? THRESHOLD[value]?.long : "";
+function longToken(name, value, ctx) {
+  const share = name === "threshold" ? thresholdNote(value, ctx, true) : "";
   return `${name} ${String(value || "off")}${share ? ` (${share})` : ""}`;
 }
 
@@ -114,15 +114,15 @@ function longToken(name, value) {
 // for nine knobs: `full` gives each knob one icon and one value and groups them by layer, `names`
 // spells the same nine out for when a letter would not be clear, and `preset` drops the knobs for one
 // word — the preset is what determines all nine anyway.
-function statusText(state) {
+function statusText(state, ctx) {
   if (!state || state.status === "off") return "";
   const style = state.status;
   const preset = `${PRESET_MARKER} ${String(state.preset || "custom").toUpperCase()}`;
   if (style === "preset") return preset;
   if (style === "names") {
-    return [preset, ...KNOB_ORDER.map((name) => longToken(name, state[name]))].join(" · ");
+    return [preset, ...KNOB_ORDER.map((name) => longToken(name, state[name], ctx))].join(" · ");
   }
-  const groups = KNOB_GROUPS.map((group) => group.map((name) => shortToken(name, state[name])).join(" "));
+  const groups = KNOB_GROUPS.map((group) => group.map((name) => shortToken(name, state[name], ctx)).join(" "));
   return [preset, ...groups].join(" · ");
 }
 
@@ -137,14 +137,14 @@ export const STATUS_LEVELS = Object.freeze({
 
 // What the row *would* say under a given shape, for the menu that offers the shapes: the preview runs
 // the real renderer over a copy of the state, so it can never drift from what gets written.
-export function previewRow(state, style) {
-  return statusText({ ...state, status: style });
+export function previewRow(state, style, ctx) {
+  return statusText({ ...state, status: style }, ctx);
 }
 
 export function renderModes(state, ctx) {
   const ui = ctx?.ui;
   if (!ui?.setStatus) return "";
-  const text = statusText(state);
+  const text = statusText(state, ctx);
   // An empty string is still a status: omp renders one row per status, so `""` would leave a blank
   // footer row where the combo row used to be. `undefined` deletes the key and the row with it.
   ui.setStatus(STATUS_KEY, text || undefined);

@@ -88,8 +88,16 @@ const PRESETS = Object.freeze({
 export const BEHAVIOUR_KNOBS = Object.freeze(MODE_KNOBS.filter((knob) => knob !== "status"));
 
 // The row shape a session starts with when nothing stored a preference. It lives beside the presets
-// rather than inside them, which is what keeps a preset application from touching the layout.
-export const DEFAULT_STATUS = "full";
+// rather than inside them, which is what keeps a preset application from touching the layout. `names`
+// is the default because a footer is read, not decoded: the nine one-letter tokens say nothing until
+// the reader has learned the table, and the names themselves are what `/ts set` takes.
+export const DEFAULT_STATUS = "names";
+
+// The share of the context window each `threshold` level stands for, mapped by token-saver onto
+// `compaction.thresholdPercent` and printed by status-line.js in the row — one number, two readers,
+// so it lives here rather than in either of them. `-1` is the host's own "no share of my own", whose
+// limit is the reserve rather than a share.
+export const THRESHOLD_PERCENT = Object.freeze({ off: -1, lite: 85, full: 70, ultra: 55 });
 
 export const PRESET_NAMES = Object.freeze(Object.keys(PRESETS));
 export const DEFAULT_PRESET = "max";
@@ -115,6 +123,13 @@ export const DEFAULT_OPTIONS = Object.freeze({
   // Which port the pack's headroom proxy listens on. 8787 is headroom's own default, so a proxy you
   // started yourself owns it — this is how the pack runs beside one instead of fighting it.
   headroom: Object.freeze({ port: 8787 }),
+  // The two compaction limits, and which one is written when both are set. `percent` is a share of
+  // the context window (`-1` = whatever the `threshold` level stands for), `tokens` is an absolute
+  // cap (`-1` = none), and `pick` decides between them: `auto` writes the one that fires first,
+  // `percent`/`tokens` pin one. The decision has to be made here because a positive
+  // `compaction.thresholdTokens` silently outranks the percent in the host — "whichever is lower"
+  // is not something the host can express.
+  threshold: Object.freeze({ percent: -1, tokens: -1, pick: "auto" }),
 });
 
 // Accepted values for the string options. An option that gates a behaviour is an enum, not free
@@ -122,6 +137,7 @@ export const DEFAULT_OPTIONS = Object.freeze({
 // instead of letting a second vocabulary for one setting into the config file.
 export const OPTION_VALUES = Object.freeze({
   native: Object.freeze({ mode: Object.freeze(["off", "auto"]) }),
+  threshold: Object.freeze({ pick: Object.freeze(["auto", "percent", "tokens"]) }),
 });
 
 // Own-property lookup, never `KNOBS[name]`: `constructor`, `toString` and friends are inherited from
@@ -138,6 +154,39 @@ export function normalizeMode(name, value) {
   }
   const mode = String(value ?? "").trim().toLowerCase();
   return KNOBS[name].includes(mode) ? mode : null;
+}
+
+// Every level a piece of caveman rule text names after `/caveman` that no `/caveman` here accepts, in
+// order of appearance. Two readers need the same verdict: caveman-session refuses to inject a rule
+// naming a foreign level, and the updater refuses to call the upstream copy an update while it names
+// one. That upstream text advertises `wenyan-lite|wenyan-full|wenyan-ultra` — three values this pack
+// does not have — which is why the check exists at all.
+export function foreignLevels(text) {
+  const allowed = new Set(KNOBS.caveman);
+  const foreign = new Set();
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const at = line.indexOf("/caveman");
+    if (at < 0) continue;
+    // Everything after the command name on that line, split on the separators a level list uses.
+    for (const token of line.slice(at + "/caveman".length).split(/[^A-Za-z-]+/)) {
+      const level = token.toLowerCase();
+      if (level && !allowed.has(level)) foreign.add(level);
+    }
+  }
+  return [...foreign];
+}
+
+// The `read`, `compress`, `prune` and `threshold` knobs reach OMP's own settings only when
+// `options.native.mode` is `auto`. While it is `off` — the default, and it stays the default because
+// writing a user's config.yml has to be opt-in — a preset carrying real levels changes prompt text and
+// the row and nothing else. One line, naming the one command that closes the gap; null when there is
+// none to name.
+const NATIVE_GAP_PRESETS = Object.freeze(["high", "max", "ultra"]);
+
+export function nativeGapHint(preset, nativeMode) {
+  return NATIVE_GAP_PRESETS.includes(preset) && nativeMode !== "auto"
+    ? "knobs are prompt-level only — /ts native on also writes OMP's read/compress/prune/threshold keys"
+    : null;
 }
 
 // The value to store for a string option, or null when it takes no such value.
@@ -258,6 +307,30 @@ export function readConfig() {
 
 export function readDefaultModes() {
   return readConfig().modes;
+}
+
+// The context window a session's model reports, or `0` when there is none to read (an unresolved
+// model). Both the native writer and the row need the same number to compare a share against a fixed
+// cap, so the read lives here rather than in each caller.
+export function sessionContextWindow(ctx) {
+  const window = ctx?.models?.current?.()?.contextWindow;
+  return typeof window === "number" && window > 0 ? window : 0;
+}
+
+// Which of the two compaction limits a session actually gets, as the pair of host keys the caller
+// writes. `percent` falls back to the level's own share, `tokens` to "no cap"; the `auto` pick keeps
+// the fixed cap only when it fires no later than the share does for this session's context window,
+// because the host hands the cap priority the moment it is positive. With no window to compare
+// against, the cap is the only limit left that can be evaluated, so it stands.
+export function resolveThreshold(options, levelPercent, contextWindow) {
+  const percent = options?.percent > 0 ? options.percent : levelPercent;
+  const tokens = options?.tokens > 0 ? options.tokens : -1;
+  if (options?.pick === "percent") return { percent, tokens: -1 };
+  if (options?.pick === "auto" && tokens > 0) {
+    const shareTokens = percent > 0 && contextWindow > 0 ? (percent / 100) * contextWindow : Infinity;
+    if (tokens > shareTokens) return { percent, tokens: -1 };
+  }
+  return { percent, tokens };
 }
 
 // Patch keys: `preset` (replaces every mode), `modes` (per-knob override), `options` (global

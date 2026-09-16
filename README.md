@@ -1,9 +1,10 @@
-# oh-my-pi-supreme-token-saver (fork)
+# omp-supreme-token-saver (fork)
 
 A fork of [`@fernado03/oh-my-pi-supreme-token-saver`](https://www.npmjs.com/package/@fernado03/oh-my-pi-supreme-token-saver)
 for [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi). It ships six presets (`off` → `ultra`) over
 nine knobs — `caveman`, `rtk`, `ponytail`, `read`, `compress`, `prune`, `threshold`, `autoRtk`, `status` —
-behind one command surface (`/token-saver`, alias `/ts`; `/combo` kept as a preset-only alias) and one footer row.
+behind one command surface (`/token-saver`, alias `/ts`; `/combo` kept as a preset-only alias) and one footer row
+that spells every knob out by default (`/ts set status=full` trades the names for one icon and one letter per knob).
 The `read`, `compress`, `prune` and `threshold` knobs drive OMP's **own** native token-economy settings
 (`read.summarize.*`, `shellMinimizer.*`, `compaction.*`, artifact spill, `read.defaultLimit`) through
 `omp config`, gated by `options.native.mode`; the preset supplies those knobs' starting levels plus four
@@ -55,12 +56,29 @@ above.
 
 ## Install
 
-From a clone:
+Two ways in, and only one of them may be active at a time — both register the same six extension
+modules, so running the installer on top of a marketplace install (or the reverse) loads every module
+twice. Pick one; to switch, run the cutover in [CLI](#cli): `uninstall --legacy-only` removes the legacy
+tree and its `config.yml` entries, `plugin` adds the runtime dependencies the marketplace does not
+carry, and `omp plugin install` supplies the modules.
+
+From a clone — the installer copies the modules into `~/.omp/agent/extensions` and registers them in
+`~/.omp/agent/config.yml`:
 
 ```bash
-git clone https://github.com/dillydalli3r/oh-my-pi-supreme-token-saver
-cd oh-my-pi-supreme-token-saver
+git clone https://github.com/dillydalli3r/omp-supreme-token-saver
+cd omp-supreme-token-saver
 node install-omp-addons.js install --yes
+```
+
+As a marketplace plugin — omp reads the modules from the package's own `omp.extensions` (below), with
+no `config.yml` entries and no copies. The marketplace carries no runtime dependencies, so the Ponytail
+plugin and the rtk binary come from the installer's `plugin` verb:
+
+```bash
+omp plugin marketplace add dillydalli3r/omp-addons
+omp plugin install supreme-token-saver@omp-addons
+node install-omp-addons.js plugin --yes    # ponytail + rtk only; no extension copying
 ```
 
 Windows: run `install.bat` in the clone — no arguments runs `node install-omp-addons.js install --yes`,
@@ -71,7 +89,7 @@ readable instead of a window that vanishes.
 Without cloning:
 
 ```bash
-npx --yes --allow-git=all github:dillydalli3r/oh-my-pi-supreme-token-saver install --yes
+npx --yes --allow-git=all github:dillydalli3r/omp-supreme-token-saver install --yes
 ```
 
 `--preset <name>` seeds `~/.omp/agent/token-saver.json` **only when that file does not exist yet**;
@@ -82,6 +100,25 @@ registers them in `~/.omp/agent/config.yml`, installs the Ponytail plugin and th
 `hideStatus=true` / `quietStartup=true` to the Ponytail plugin config so only the pack's own row shows.
 The installer never writes OMP's native settings — that layer is opt-in (see
 [Native settings](#native-settings)).
+
+### What loads
+
+`package.json` `omp.extensions` declares every module, in load order:
+
+| # | Module | What it owns |
+|---|---|---|
+| 1 | `extensions/shared/mode-reinforcement.js` | the one model-facing reminder line |
+| 2 | `extensions/caveman-session/index.js` | `/caveman`, and the rule injected for `full` |
+| 3 | `extensions/rtk-session/index.js` | `/rtk`, `/rtk auto`, and the bash rewrite |
+| 4 | `extensions/token-saver/index.js` | `/token-saver` (`/ts`), `/combo`, presets, the native driver |
+| 5 | `extensions/ai-addons-updater/index.js` | `/ai-addons` — version checks, the startup notice, updates |
+| 6 | `extensions/amanai-reward/index.js` | the passive reward-key detector |
+
+A non-empty `omp.extensions` array is authoritative: a module missing from that list is a silently
+missing feature, not a fallback to convention. `extensions/shared/session-state.js` and
+`extensions/shared/status-line.js` are libraries those six import — they export no factory, so they are
+not loaded as extensions and are not in the list. `pi.extensions` still names `amanai-reward/pi.js` for
+the pre-2.0 manifest key; the loader treats it as the legacy alternative, never as a second copy.
 
 ## Presets
 
@@ -121,7 +158,8 @@ the `rtk` knob is whether that binary is in play at all — and the four knobs t
 economy (`read`, `compress`, `prune`, `threshold`) stay adjacent. `status` is last because it is not a
 behaviour; it picks the row's own shape.
 
-The stored default for new sessions is `max` until changed with `/ts default <preset>`.
+The stored default for new sessions is `max` until changed with `/ts default <preset>`, and its footer row starts
+on the `names` shape until `/ts default status=<shape>` says otherwise.
 
 The `read`, `compress`, `prune` and `threshold` columns are **knob levels, not OMP settings**: each level
 names the exact native keys it writes (see [Native settings](#native-settings)), and preset `off` pins
@@ -135,7 +173,7 @@ One surface. `/token-saver` and `/ts` are identical; `/combo` accepts presets pl
 | Command | Effect |
 |---|---|
 | `/token-saver` or `/ts` | Opens the settings menu — presets, knobs, stored defaults, options, `config.yml` — so nothing has to be typed or hand-edited. Prints the status text instead when the session has no selector (subagent, print run, RPC) |
-| `/ts status` | The status text: preset, every knob, config path, native gate, stored default |
+| `/ts status` | The status text: preset, every knob, config path, native gate (plus the `/ts native on` line while the gate leaves the knob levels unwritten), stored default |
 | `/ts config` (alias `/ts settings`) | The same menu, explicitly |
 | `/ts <preset>` or `/ts preset <preset>` | Apply a preset to this session (also `/combo <preset>`) |
 | `/ts set <knob>=<value> …` | Set one or more knobs for this session; all pairs validated before any is written |
@@ -143,7 +181,7 @@ One surface. `/token-saver` and `/ts` are identical; `/combo` accepts presets pl
 | `/ts default <preset>` | Store a preset as the default for new sessions |
 | `/ts default <knob>=<value> …` | Store a partial override (displays as `custom` only when the resulting state matches no preset) |
 | `/ts default reset` | Delete the config file; back to built-in `max` |
-| `/ts option <group>.<key>=<value>` | Set a behaviour option for new sessions — `autoRtk.timeoutMs`, `autoRtk.exclude`, `native.mode` (the whole option list) |
+| `/ts option <group>.<key>=<value>` | Set a behaviour option for new sessions — `autoRtk.timeoutMs`, `autoRtk.exclude`, `native.mode`, `threshold.percent`, `threshold.tokens`, `threshold.pick` (the whole option list) |
 | `/ts native [status\|on\|off\|apply\|reset]` | Inspect/apply OMP's own settings; `on` is an alias for `auto` |
 | `/ts headroom [status\|wrap\|unwrap\|unwrap-models\|install]` | Optional external Headroom proxy: `wrap` routes this session's provider through it (any family the proxy carries, not just Anthropic), `unwrap` unroutes and stops a proxy the pack started (see [Optional: Headroom](#optional-headroom)) |
 | `/ts help` | Usage, knob list, option list |
@@ -155,14 +193,26 @@ state — without it the knob change would be display-only.
 Individual add-ons:
 
 ```text
-/caveman [lite|full|ultra|wenyan|off|status]   bare = full
+/caveman [off|lite|full|ultra|wenyan|status]   bare = full
 /rtk [on|off|status|gain]                      gain prints RTK's self-reported counters
 /rtk auto [on|off|status]                      automatic rewrite of eligible bash commands
 /ponytail [lite|full|ultra|off|status]         provided by the Ponytail plugin, not by this repo
-/ai-addons <check|status>                      version check for ponytail / rtk / caveman
-tokensaver reports a local-vs-remote date estimate (it publishes no version)
+/ai-addons <check|status>                      installed vs published version, per add-on
 /ai-addons update <ponytail|rtk|caveman|tokensaver|all> [--dry-run]
+/ai-addons level [on|off]                      the session-start update check (see below)
 ```
+
+`tokensaver` is compared by version, not by date: the row reads the installed version from the tree's
+version stamp, the marketplace lock file or the package.json it travels with, and the published one
+from the repo's manifest (plus the npm registry when the package is there). A version it cannot resolve
+is reported as `unknown` rather than guessed from a file's mtime.
+
+The `full` rule is validated before it is injected. The installer may overwrite
+`extensions/caveman-session/rule.md` with the upstream caveman text, which advertises
+`wenyan-lite|wenyan-full|wenyan-ultra` — three levels `/caveman` here rejects — so a rule.md naming any
+level the command does not take is not served: the copy bundled inside the extension is, which makes an
+online and an offline install inject identical text. `/ai-addons update caveman` refuses to write such a
+rule and says why instead of churning the file.
 
 Natural-language off switch for caveman: a bare input of `caveman off`, `stop caveman`, or `normal mode`
 sets it back to `off` for the session.
@@ -177,9 +227,9 @@ entry is a front end for the verb above it, so a pick reaches the same write the
 |---|---|
 | Preset | The six presets, each showing the knobs it sets; a pick applies it to the session |
 | Knob | One knob, then its level, then where it goes — **This session** (`/ts set`) or **New sessions** (`/ts default`) |
-| Footer row | The five row shapes, each option previewing the exact row it would render; a pick applies `/ts set status=<shape>` |
+| Footer row | The four row shapes, each option previewing the exact row it would render, then where it goes — **This session** (`/ts set status=`) or **New sessions** (`/ts default status=`) |
 | Default for new sessions | The preset list plus `reset`, which deletes `token-saver.json` |
-| Behaviour options | `autoRtk.timeoutMs`, `autoRtk.exclude`, `native.mode`; an enum picks from a list, a number or a list takes typed input |
+| Behaviour options | `autoRtk.timeoutMs`, `autoRtk.exclude`, `native.mode`, `threshold.percent`, `threshold.tokens`, `threshold.pick`; an enum picks from a list, a number or a list takes typed input |
 | OMP's own settings | `status` / `apply` / `auto` / `off` / `reset` for `config.yml`, the `/ts native` verbs |
 | Headroom | Proxy health, `wrap` / `unwrap` for this session, and `unwrap-models` for a durable wrap |
 | Status | The same text `/ts status` prints |
@@ -188,6 +238,51 @@ Escape backs out of a level without writing. The menu needs the interactive TUI:
 run, or an RPC client (`hasUI: false`) prints the typed verb list instead. What it writes is the same
 value a hand-edited `~/.omp/agent/token-saver.json` would hold, so the file and the menu stay
 interchangeable.
+
+## Startup update check
+
+`extensions/ai-addons-updater/index.js` runs the same check `/ai-addons check` runs — once, off the
+turn, at most once per stored interval. It never blocks startup: the `session_start` handler returns
+immediately and the check resolves in the background, so a slow or unreachable GitHub cannot delay the
+first prompt.
+
+- **Throttle.** `ai-addons-state.json` holds `lastCheck`; anything inside the interval (default 6h)
+  returns without a network call. The timestamp is written *before* the fetch, so a machine that is
+  offline at every start does not re-attempt the whole set on every session.
+- **One line, when it is news.** Nothing is said while every add-on is current. When something is
+  outdated the notice names each one and the exact command to run, e.g.
+  `ai-addons: 1 update: tokensaver 2.1.0 → 2.2.0 — run /ai-addons update tokensaver`. The same result is
+  not announced twice: the state file also stores the signature of what was announced, so restarting
+  a session does not repeat a nag no new release stands behind.
+- **The native gap, named once.** The `read` / `compress` / `prune` / `threshold` knobs reach OMP's own
+  settings only when `options.native.mode` is `auto`, and that gate stays `off` by default — writing
+  `config.yml` is opt-in. While a session runs preset `high`, `max` or `ultra` with the gate off, the
+  notice carries one extra line naming `/ts native on`. `/ts status` prints the same line (`Native knobs:
+  …`) so it is there whenever it is asked for, and it disappears the moment the gate writes.
+- **Off switch.** `/ai-addons level on|off` stores it; `level` alone reports it.
+
+| File | What it holds |
+|---|---|
+| `~/.omp/agent/ai-addons.json` | `{"checkOnStart": true, "intervalHours": 6}` — the switch and the interval |
+| `~/.omp/agent/ai-addons-state.json` | `{"lastCheck": …, "notified": "<signature>"}` |
+
+Both sit next to `token-saver.json`, so `OMP_TOKEN_SAVER_CONFIG` moves them with it.
+
+**Version sources.** The installed version is read from the most specific source that answers, and
+reported as `unknown` when none does:
+
+| # | Source | Layout |
+|---|---|---|
+| 1 | `<extensions>/.omp-token-saver-version` (the stamp an install writes; JSON or a bare version) | either |
+| 2 | `<plugins>/omp-plugins.lock.json` → `plugins["@dillydalli3r/omp-supreme-token-saver"].version` | plugin |
+| 3 | the `package.json` the module travels with | plugin, or a repo checkout |
+
+Every path the updater resolves is derived from its own module URL, so it runs unchanged from
+`~/.omp/agent/extensions/…` and from `~/.omp/plugins/node_modules/…`: the caveman rule and the
+token-saver module are siblings, the Ponytail manifest and the lock file come from the plugins root
+(`$XDG_DATA_HOME/omp/plugins` when that root exists, else `~/.omp/plugins`). A path that resolves to
+nothing is reported as such — `RTK not installed: no binary at …`, `no manifest at …` — never as a
+failed check with no explanation.
 
 ## Native settings
 
@@ -250,20 +345,49 @@ Levels: `off` · `lite` · `full` · `ultra`.
 | OMP key | off | lite | full | ultra | What it is |
 |---|---|---|---|---|---|
 | `compaction.thresholdPercent` | -1 | 85 | 70 | 55 | Share of the context window at or above which OMP compacts after a turn; `-1` = reserve-based |
+| `compaction.thresholdTokens` | -1 | -1 | -1 | -1 | Fixed token limit; a positive value outranks the share. `options.threshold` is what sets it |
 | `compaction.idleEnabled` | false | false | true | true | Also compact while the session sits idle, once the token count below is passed |
 | `compaction.idleThresholdTokens` | 200000 | 200000 | 120000 | 80000 | Token count that arms idle compaction |
 
-Those three keys are the compaction *trigger*: `prune` says what a compaction may drop, this says how full the
+Those four keys are the compaction *trigger*: `prune` says what a compaction may drop, this says how full the
 context has to get before one runs. The level word alone hides the number it picked, so the footer shows the
-number in the level's place — `⏱️70%` for `full`, `⏱️res` for `off`, whose limit is the host's reserve rather
-than a share of its own — and the spelled row carries both (`threshold full (70%)`).
+number in the level's place — `⏱️70%` for `full`, `⏱️100k` once a token cap is pinned, `⏱️res` for `off`, whose
+limit is the host's reserve rather than a share of its own — and the spelled row carries both
+(`threshold full (70%)`).
 
-`compaction.thresholdPercent` is the only one of the three that is a *share* of the context window, which is why
+`compaction.thresholdPercent` is the only one of the four that is a *share* of the context window, which is why
 the knob dials it and not an absolute cap: the same percent means different token counts on a 200k and a 1M
 model, and an absolute number would be wrong the moment the session changes model. Lower percent = compaction
 fires earlier = fewer tokens carried per turn, but each compaction rewrites the prompt prefix, so it also means
 more cache re-reads. `off` writes `-1`, which is the host's own reserve-based default — a 16384-token floor and
 at least 15% of the window — **not** "never compact"; this knob never touches `compaction.enabled`.
+
+#### An exact share or an exact limit
+
+The level picks a share from a four-step table; `options.threshold` is for when that is not exact enough:
+
+| Option | Default | What it does |
+|---|---|---|
+| `threshold.percent` | `-1` | The share to write, replacing the level's own (`40` = compact at 40% of the window). `-1` follows the level |
+| `threshold.tokens` | `-1` | A fixed token limit, for a model whose window you know and whose share you would rather pin in tokens. `-1` = none |
+| `threshold.pick` | `auto` | Which of the two is written: `auto` (whichever fires first), `percent` or `tokens` |
+
+```bash
+/ts option threshold.tokens=100000      # never carry more than 100k tokens into a turn
+/ts option threshold.percent=40         # and/or compact at 40% of whatever window is in play
+/ts option threshold.pick=auto          # write whichever of the two fires first (the default)
+```
+
+The host applies a positive `compaction.thresholdTokens` **whenever it is set**, before the share is even read,
+so "whichever is lower" is not something `config.yml` can express — the pack has to decide, and it decides with
+the window the session's model reports: with `pick=auto` the cap is written only when it is no higher than
+`percent`% of that window, and the losing limit is written back to `-1` rather than left in the file to outrank
+the winner. `pick=percent` and `pick=tokens` skip the comparison and pin one of them. With no window to read
+(an unresolved model), the cap is the only limit that can be evaluated, so `auto` keeps it.
+
+The comparison uses the window `<provider>/<model>` reports *now*: switching to a much smaller model makes the
+share fire earlier, and a cap that was the lower limit stays written until the next native apply. Re-run
+`/ts native apply` (or change any knob) after a model switch to re-decide.
 
 The idle pair is the second trigger: `off` and `lite` leave idle compaction off, `full` and `ultra` turn it on
 and bring the token trigger down with it. The two token numbers are **absolute** because the host key is —
@@ -296,15 +420,16 @@ Notes that matter:
   and `prune=off` writes `compaction.supersedeReads=false` plus `compaction.dropUseless=false`. That turns
   the host's summaries and pruning off — the presets `off` and `lite` carry `read=off`, and `off`, `lite`
   and `medium` carry `prune=off`.
-- `off` as a *preset* is different: it writes no keys at all and instead resets all 21 keys in these tables
+- `off` as a *preset* is different: it writes no keys at all and instead resets all 22 keys in these tables
   to whatever OMP then considers sane, which is more durable than pinning `false`.
-- Deliberately untouched inside `compaction.*`: `compaction.thresholdTokens` (a positive absolute cap silently
-  outranks the percent, so the pack leaves it at the host's `-1` and lets the percent follow the model),
-  `compaction.midTurnEnabled`, `compaction.methodOrder`, `compaction.asyncEnabled`, `compaction.autoContinue`
-  and `compaction.reserveTokens` — those decide *how* and *with what* a compaction runs, and this pack only
-  dials *when*. Also untouched: `provider.appendOnlyContext`, `memory.backend`, `advisor`/`autolearn`/`prewalk`,
-  `snapcompact`, and every display/statusLine/tui key — display keys cost no model tokens.
-- `/ts native reset` runs one `omp` process per key (21). A missing `omp` CLI degrades `/ts native apply`
+- Deliberately untouched inside `compaction.*`: `compaction.midTurnEnabled`, `compaction.methodOrder`,
+  `compaction.asyncEnabled`, `compaction.autoContinue` and `compaction.reserveTokens` — those decide *how* and
+  *with what* a compaction runs, and this pack only dials *when*. (`compaction.thresholdTokens` is written, but
+  only through `options.threshold`: a level never sets a positive value, because a positive cap silently
+  outranks the share and would then be wrong on the next model.) Also untouched: `provider.appendOnlyContext`,
+  `memory.backend`, `advisor`/`autolearn`/`prewalk`, `snapcompact`, and every display/statusLine/tui key —
+  display keys cost no model tokens.
+- `/ts native reset` runs one `omp` process per key (22). A missing `omp` CLI degrades `/ts native apply`
   (and any preset-time native write) to a warning
   (`Native settings unavailable: … config.yml untouched.`); the preset itself still applies.
 
@@ -451,16 +576,21 @@ After `/ts default max`, `/ts default ponytail=off`, `/ts option autoRtk.exclude
   every mode override, which is what makes it stick.
 - `/ts default <preset|knob=value|reset>` writes `preset`/`modes` (`reset` deletes the file). It changes
   what **new** sessions start from; the running session is untouched.
-- `/ts option <group>.<key>=<value>` writes `options.<group>.<key>`. Only two groups exist, and the value
+- `/ts option <group>.<key>=<value>` writes `options.<group>.<key>`. Four groups exist, and the value
   type decides the syntax: `autoRtk.timeoutMs` takes a number, `autoRtk.exclude` takes a JSON array
-  (`/ts option autoRtk.exclude=[".git","dist"]`), and `native.mode` is a string — `auto` (or `on`/`true`) makes
-  presets and knob changes write `config.yml`, `off` leaves it alone, and any other value is rejected. Unknown groups, unknown
-  keys, a non-numeric `timeoutMs`, and an `exclude` that is not a JSON array are rejected with a usage
-  line. Options describe behaviour (timeouts, exclusion lists, the native gate), not intensity. They are
-  stored for the sessions that follow, but two of them are read at different times: `autoRtk.*` is cached
-  when a session starts, while `native.mode` is read at every native write, so flipping it takes effect on
-  the running session's next preset or knob change.
-- The stored defaults are `autoRtk.timeoutMs=2000`, `autoRtk.exclude=[]`, `native.mode=off`, so a fresh
+  (`/ts option autoRtk.exclude=[".git","dist"]`), `headroom.port` a port, and `native.mode` is a string — `auto`
+  (or `on`/`true`) makes presets and knob changes write `config.yml`, `off` leaves it alone, and any other value
+  is rejected. Unknown groups, unknown keys, a non-numeric `timeoutMs`, and an `exclude` that is not a JSON array
+  are rejected with a usage line. Options describe behaviour (timeouts, exclusion lists, the native gate),
+  not intensity. They are stored for the sessions that follow, but they are read at different times: `autoRtk.*`
+  is cached when a session starts, while `native.mode` and the `threshold.*` limits are read at every native write
+  and every row render, so flipping those takes effect on the running session's next preset, knob change or
+  `native apply`.
+- `threshold.percent` and `threshold.tokens` are numbers (`-1` = unset, meaning "the level's share" and "no fixed
+  cap"), and `threshold.pick` is `auto` \| `percent` \| `tokens`. They are the one option group a *level* also
+  speaks about, which is why the footer row reports the limit that wins rather than the level's own number.
+- The stored defaults are `autoRtk.timeoutMs=2000`, `autoRtk.exclude=[]`, `native.mode=off`,
+  `headroom.port=8787`, `threshold.percent=-1`, `threshold.tokens=-1`, `threshold.pick=auto`, so a fresh
   file needs no `options` block at all.
 - Choosing a ponytail default also pushes it into the Ponytail plugin's own config, and reports
   `[pending] Ponytail plugin not found` when that write fails.
@@ -472,10 +602,13 @@ Environment overrides:
 
 | Variable | Overrides |
 |---|---|
-| `OMP_TOKEN_SAVER_CONFIG` | Path of `token-saver.json` |
+| `OMP_TOKEN_SAVER_CONFIG` | Path of `token-saver.json`; the updater's `ai-addons.json` and `ai-addons-state.json` follow its directory |
 | `OMP_COMBO_DEFAULTS_FILE` | Path of the legacy `combo-defaults.json` |
 | `OMP_PONYTAIL_PACKAGE_DIR` | Location of the Ponytail plugin package (default reading/writing of its `defaultMode`) |
 | `OMP_HEADROOM_STATE` | Path of the headroom wrap state (`headroom.json`); the proxy log follows the agent dir |
+| `OMP_CAVEMAN_RULE` | Path of the caveman rule read for `full` (default `extensions/caveman-session/rule.md`) |
+| `OMP_TOKEN_SAVER_VERSION_STAMP` | Path of the installed version stamp the check reads |
+| `XDG_DATA_HOME` | Marketplace root: `$XDG_DATA_HOME/omp/plugins` is used when it exists, else `~/.omp/plugins` |
 | `PI_CODING_AGENT_DIR` | Relocates the whole agent dir — the pack's `headroom.json`, the `models.yml` its headroom status reads, and the `config.yml` the native layer writes |
 
 ## Status row
@@ -486,27 +619,31 @@ built to fit a footer rather than to document the pack:
 
 | `status` | Row | Why |
 |---|---|---|
-| `full` (default) | `🧩 MAX · 🦴U 🦀ON 🔁ON 🐴U · 📖F 🗜️F 🧹F ⏱️70% · 🔀OFF` | One icon and one value per knob, no label repeating what the icon says, grouped by the layer the knob configures: the prompt add-ons, the four OMP settings, the extras |
-| `names` | `🧩 MAX · caveman ultra · rtk on · autoRtk on · ponytail ultra · read full · compress full · prune full · threshold full (70%) · headroom off` | The same nine knobs spelled out — the knob's real name and its level in the lowercase the commands take — for when a letter would not be clear |
+| `names` (default) | `🧩 MAX · caveman ultra · rtk on · autoRtk on · ponytail ultra · read full · compress full · prune full · threshold full (70%) · headroom off` | Every knob spelled out — the knob's real name and its level in the lowercase the commands take. A footer is read, not decoded, so this is what a session starts on |
+| `full` | `🧩 MAX · 🦴U 🦀ON 🔁ON 🐴U · 📖F 🗜️F 🧹F ⏱️70% · 🔀OFF` | One icon and one value per knob, no label repeating what the icon says, grouped by the layer the knob configures: the prompt add-ons, the four OMP settings, the extras — for a footer with no room for nine words |
 | `preset` | `🧩 MAX` | One word: the preset determines all nine knobs anyway |
 | `off` | *(no row)* | The key is deleted, not blanked |
 
-How a knob is written in the default row:
+How a knob is written in the `full` row:
 
 - An `on`/`off` knob keeps the word (`🦀ON`, `🔁OFF`): both spellings start with "O", so one letter would not
   say which one is set.
 - A level knob shortens to its first letter (`🦴U` = `caveman=ultra`, `🗜️F` = `compress=full`) — off/lite/full/ultra,
   plus `wenyan` for caveman.
 - `threshold` shows the number instead of the letter (`⏱️70%`), because the letter is only a stand-in for that
-  number and the row has room for one of them; `off` renders `⏱️res`, the host's reserve-based default.
+  number and the row has room for one of them; a pinned token cap renders as `⏱️100k`, and `off` renders
+  `⏱️res`, the host's reserve-based default. The `names` row carries the level and the number
+  (`threshold full (70%)`), resolved by the same function that writes the keys, so the row cannot describe a
+  limit `config.yml` is not set to.
 - A knob whose icon is missing renders as `name value` rather than vanishing.
 
 - The row opens with the preset, so it is also the readout of which preset the session is on — and no preset
   changes the shape, so switching presets never moves the row's layout.
-- `compact` was a shape until the default `full` row became the narrow one; the two would now be the same row
-  twice, so it is gone. A stored or branched `compact` resolves to the default instead of erroring.
+- `compact` was a shape until a narrow non-icon row arrived; the two would now be the same row twice, so it is
+  gone. A stored or branched `compact` resolves to the default instead of erroring.
 - `/ts config` → **Footer row** lists these with the exact row each one would render, so the shape is
-  picked by what it looks like rather than spelled from memory (`Knob` → `status` sets the same knob).
+  picked by what it looks like rather than spelled from memory (`Knob` → `status` sets the same knob), and the
+  pick then asks where it goes — **This session** or **New sessions** — like every other knob.
 - `status` is display-only, and that is load-bearing in two places: it is excluded from the
   preset match — choosing a row shape on an `ultra` session keeps reporting `ULTRA`, not `custom` — and
   it writes nothing to `config.yml`, since a display key costs no model tokens.
@@ -520,8 +657,13 @@ How a knob is written in the default row:
 | Shared modules (`session-state.js`, `status-line.js`, `mode-reinforcement.js`) | `~/.omp/agent/extensions/shared/` |
 | Caveman extension | `~/.omp/agent/extensions/caveman-session/` |
 | RTK extension | `~/.omp/agent/extensions/rtk-session/` |
-| Updater extension (`/ai-addons`) | `~/.omp/agent/extensions/ai-addons-updater/` |
+| Updater extension (`/ai-addons`, startup check) | `~/.omp/agent/extensions/ai-addons-updater/` |
 | Amanai reward detector | `~/.omp/agent/extensions/amanai-reward/` |
+| Installed version stamp (read by the check; absent on a plugin install) | `~/.omp/agent/extensions/.omp-token-saver-version` |
+| Startup check switch and interval | same directory as `token-saver.json` — `~/.omp/agent/ai-addons.json` |
+| Startup check state (`lastCheck`, `notified`) | same directory as `token-saver.json` — `~/.omp/agent/ai-addons-state.json` |
+| The same six modules, marketplace layout | `~/.omp/plugins/node_modules/@dillydalli3r/omp-supreme-token-saver/extensions/` (per `package.json` `omp.extensions`) |
+| Marketplace install record | `~/.omp/plugins/omp-plugins.lock.json`, `~/.omp/plugins/installed_plugins.json` |
 | Ponytail plugin | `~/.omp/plugins/node_modules/@dietrichgebert/ponytail/` |
 | Ponytail plugin config (`defaultMode`, `hideStatus`, `quietStartup`) | `$XDG_CONFIG_HOME/ponytail/config.json`, else `%APPDATA%\ponytail\config.json`, else `~/.config/ponytail/config.json` |
 | RTK binary | `~/.bun/bin/rtk` (`rtk.exe` on Windows) |
@@ -535,6 +677,33 @@ Pre-2.0 shipped a separate `combo-toggle` extension directory. 2.0 has no such d
 registered by `token-saver`.
 
 ## Troubleshooting
+
+### The injected caveman rule is not the upstream one
+
+By design. The upstream text advertises `wenyan-lite|wenyan-full|wenyan-ultra`, none of which
+`/caveman` accepts, so serving it would tell you to type values the command rejects. A rule.md that
+names any level the command does not take is skipped in favour of the copy bundled in
+`extensions/caveman-session/index.js`, which is identical to the rule.md this repo ships — an install
+with network access and one without inject the same text. `/ai-addons check` reports it as
+`Caveman rule: serving the bundled rule — the published rule names wenyan-lite, …`, and
+`/ai-addons update caveman` refuses to write the upstream copy. To inject your own rule, edit
+`extensions/caveman-session/rule.md` and keep it to `off|lite|full|ultra|wenyan`.
+
+### The startup notice never appears (or appears every session)
+
+It only speaks when something is actually outdated — or while a preset's native levels are unwritten
+and the gate is `off`. If it stays silent when you expect news, check `/ai-addons check`: the notice is
+throttled to `intervalHours` (default 6h) and remembers the last result it announced, so a restart does
+not repeat it. `/ai-addons level` prints the switch and the interval, `/ai-addons level off` stops it
+entirely, and deleting `~/.omp/agent/ai-addons-state.json` forces the next session to check again.
+
+### `Token saver version unknown` in the check row
+
+The check could not find a version for the installed pack: no `<extensions>/.omp-token-saver-version`
+stamp, no `omp-plugins.lock.json` entry and no `package.json` beside the modules — the exact situation
+of a legacy install the installer has never stamped. It reports `unknown` rather than guessing from a
+file's mtime. Reinstalling (which writes the stamp) or installing the pack as a marketplace plugin
+both make the row readable again.
 
 ### `/combo` is missing after upgrading
 
@@ -587,25 +756,38 @@ Entry point: `oh-my-pi-supreme-token-saver` (`install-omp-addons.js`).
 
 | Command | Purpose |
 |---|---|
-| `install` | Install the add-ons; user scope by default |
+| `install` | Install the add-ons (user scope by default) |
 | `update` | Run the latest installer — npm package first, GitHub source as fallback |
 | `reinstall` | Clean and reinstall the user-scope add-ons |
-| `doctor` | Check OMP, extension, Ponytail, RTK, and Headroom health (including the stale `combo-toggle` check; a missing Headroom is reported as optional, never fatal) |
+| `doctor` | Check the current installation (including the stale `combo-toggle` check; a missing Headroom is reported as optional, never fatal) |
 | `uninstall` | Remove the managed extensions |
+| `plugin` | Plugin layout only: install the runtime dependencies the marketplace cannot — the Ponytail plugin and the rtk binary. No extension copying and no `config.yml` edits; refuses while a legacy tree is installed |
 | `version` | Print the package version |
 | `help` | Print usage |
 
+`--doctor` and `--uninstall` remain as aliases of those two commands.
+
 | Flag | Effect |
 |---|---|
-| `--scope user\|project\|both` | Install scope (default `user`; accepts `--scope=user` too) |
+| `--scope user\|project\|both` | Install scope (default `user`; accepts `--scope=user` too). A scope that would leave the same extensions in both the CWD tree and the user tree is refused — omp discovers both, so `/caveman` and `/rtk` would register twice |
+| `--force` | Proceed despite that refusal, or install the plugin layout over a legacy tree |
+| `--legacy-only` | Uninstall: cutover mode. Remove the legacy extensions tree and its `config.yml` entries only — never `~/.omp/plugins` and never the rtk binary. The safe step before `plugin` |
 | `--preset <off\|lite\|medium\|high\|max\|ultra>` | Seed the default preset, only when `token-saver.json` is absent |
 | `--force-preset` | Let `--preset` overwrite an existing `token-saver.json` |
 | `--remove-ponytail` | Uninstall: also drop the Ponytail plugin entry from `config.yml` |
 | `--remove-rtk` | Uninstall: also delete the RTK binary |
 | `--yes`, `-y` | Non-interactive |
-| `--dry-run` | Preview writes; nothing touches disk |
+| `--dry-run` | Preview writes; nothing touches disk (a pure offline preview, including for `plugin`) |
 | `--verbose` | Debug output |
 | `--version`, `-v` / `--help`, `-h` | Same as `version` / `help` |
+
+Switching layouts — out of the legacy tree, into the marketplace one:
+
+```bash
+node install-omp-addons.js uninstall --legacy-only --yes   # legacy tree + config.yml entries only
+node install-omp-addons.js plugin --yes                    # ponytail + rtk, the parts the marketplace does not carry
+omp plugin install supreme-token-saver@omp-addons           # the six extension modules themselves
+```
 
 ## License
 

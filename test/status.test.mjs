@@ -21,6 +21,14 @@ const PONYTAIL_DIR = join(SANDBOX, "ponytail");
 const PONYTAIL_STUB = join(PONYTAIL_DIR, "stub-default.json");
 // The headroom wrap state is written next to the pack's config; same sandbox rule.
 const HEADROOM_STATE = join(SANDBOX, "headroom.json");
+// The updater keeps its own files beside the pack's config, and resolves the installed version from a
+// stamp, the marketplace lock file and the plugin directory — all three pointed into the sandbox.
+const ADDONS_CONFIG = join(SANDBOX, "ai-addons.json");
+const ADDONS_STATE = join(SANDBOX, "ai-addons-state.json");
+const VERSION_STAMP = join(SANDBOX, "token-saver-version");
+const PLUGINS_ROOT = join(SANDBOX, "xdg", "omp", "plugins");
+const LOCK_FILE = join(PLUGINS_ROOT, "omp-plugins.lock.json");
+const PLUGIN_MANIFEST = join(PLUGINS_ROOT, "node_modules", "@dillydalli3r", "omp-supreme-token-saver", "package.json");
 // A directory that does not exist: what a user without the plugin installed looks like.
 const ABSENT_PONYTAIL_DIR = join(SANDBOX, "no-ponytail");
 
@@ -28,6 +36,11 @@ process.env.OMP_TOKEN_SAVER_CONFIG = CONFIG_FILE;
 process.env.OMP_COMBO_DEFAULTS_FILE = LEGACY_DEFAULTS_FILE;
 process.env.OMP_PONYTAIL_PACKAGE_DIR = PONYTAIL_DIR;
 process.env.OMP_HEADROOM_STATE = HEADROOM_STATE;
+process.env.OMP_TOKEN_SAVER_VERSION_STAMP = VERSION_STAMP;
+// The plugins root only resolves under $XDG_DATA_HOME once that root exists on disk, so the sandbox
+// creates it and every marketplace read lands there instead of the developer's own install.
+process.env.XDG_DATA_HOME = join(SANDBOX, "xdg");
+mkdirSync(PLUGINS_ROOT, { recursive: true });
 
 // The ponytail plugin owns its own default (its command writes this module), so the stub stands in
 // for the real one rather than for one of our modules.
@@ -50,7 +63,10 @@ after(() => rmSync(SANDBOX, { recursive: true, force: true }));
 
 // Both files mean "a stored default"; a test that wants the built-in defaults starts by deleting them.
 const clearSandboxFiles = () => {
-  for (const file of [CONFIG_FILE, LEGACY_DEFAULTS_FILE, PONYTAIL_STUB, HEADROOM_STATE]) rmSync(file, { force: true });
+  for (const file of [
+    CONFIG_FILE, LEGACY_DEFAULTS_FILE, PONYTAIL_STUB, HEADROOM_STATE,
+    ADDONS_CONFIG, ADDONS_STATE, VERSION_STAMP, LOCK_FILE, PLUGIN_MANIFEST,
+  ]) rmSync(file, { force: true });
 };
 
 beforeEach(clearSandboxFiles);
@@ -70,7 +86,14 @@ const withoutPonytailPlugin = async (run) => {
 const SUBAGENT_PROMPT = "You are operating on a piece of work assigned to you by the main agent.";
 const SUBAGENT_TAIL = "Do not weaken or disable a mode unless the main agent asks for it.";
 
-// The built-in default session, rendered: the preset word plus every knob, grouped by layer.
+// The built-in default session, rendered: the preset word plus every knob. `names` is the shape a
+// fresh session starts on (DEFAULT_STATUS in shared/session-state.js), so this is what a new session
+// shows — a test that wants the one-token-per-knob `full` spelling has to set it.
+const NAMES_ROW =
+  "🧩 MAX · caveman ultra · rtk on · autoRtk on · ponytail ultra · read full · compress full · prune full · threshold full (70%) · headroom off";
+
+// The other half of that: the same state in `full`, one icon and one short value per knob, grouped by
+// layer (the preset plus one group per layer, not one segment per knob).
 const MAX_ROW = "🧩 MAX · 🦴U 🦀ON 🔁ON 🐴U · 📖F 🗜️F 🧹F ⏱️70% · 🔀OFF";
 
 // One row token per knob, plus the preset's two (`🧩`, the preset name): the row groups its knobs, so
@@ -253,8 +276,12 @@ test("a fresh session renders one row: the default preset with every knob segmen
   await rt.start();
 
   assert.deepEqual(rt.keys(), ["modes"], "the pack owns one status row");
-  assert.equal(rt.row(), MAX_ROW);
-  assert.equal(tokens(rt.row()).length, MODE_KNOB_COUNT + 2, "preset marker + preset name + one token per knob");
+  assert.equal(rt.row(), NAMES_ROW, "the default shape spells every knob out");
+  assert.equal(
+    tokens(rt.row()).length,
+    MODE_KNOB_COUNT * 2 + 3,
+    "preset marker + preset name + a name and a value per knob, plus the threshold note's two words"
+  );
 });
 
 test("session start is silent: no add-on announces itself loading", async () => {
@@ -315,6 +342,7 @@ test("every invocation path renders the same row for the same knob values", asyn
 test("a per-knob override changes only its segments, derives CUSTOM, and replays from the branch", async () => {
   const rt = await createRuntime();
   await rt.start();
+  await rt.run("ts", "set status=full");
   const before = rt.row();
 
   await rt.run("ts", "set caveman=wenyan prune=off");
@@ -352,7 +380,7 @@ test("a preset default changes new sessions only, and reset returns them to max"
 
   const reset = await createRuntime();
   await reset.start();
-  assert.equal(reset.row(), MAX_ROW);
+  assert.equal(reset.row(), NAMES_ROW, "back to the built-in preset in the default shape");
 });
 
 test("a per-knob default derives a custom default and reports the ponytail sync state", async () => {
@@ -367,7 +395,7 @@ test("a per-knob default derives a custom default and reports the ponytail sync 
 
   const fresh = await createRuntime();
   await fresh.start();
-  assert.match(fresh.row(), /^🧩 CUSTOM · 🦴W /);
+  assert.match(fresh.row(), /^🧩 CUSTOM · caveman wenyan /, "a stored override reaches a new session");
 
   await withoutPonytailPlugin(async () => {
     await rt.run("ts", "default ponytail=full");
@@ -475,16 +503,16 @@ test("the rtk knob accepts the same vocabulary /ts set rtk= does, and nothing el
   await rt.start();
 
   await rt.run("rtk", "on");
-  assert.match(rt.row(), /🦀ON/);
+  assert.match(rt.row(), /· rtk on ·/);
 
   await rt.run("rtk", "off");
-  assert.match(rt.row(), /🦀OFF/);
+  assert.match(rt.row(), /· rtk off ·/);
 
   // `true`/`false` are the boolean spelling of the same two states, not a third vocabulary.
   await rt.run("rtk", "true");
-  assert.match(rt.row(), /🦀ON/);
+  assert.match(rt.row(), /· rtk on ·/);
   await rt.run("rtk", "false");
-  assert.match(rt.row(), /🦀OFF/);
+  assert.match(rt.row(), /· rtk off ·/);
 
   const running = rt.row();
   await rt.run("rtk", "enable");
@@ -789,7 +817,7 @@ test("a second session in one process does not republish over the live state", a
   await first.start();
   await first.run("ts", "set caveman=off");
   const row = first.row();
-  assert.match(row, /^🧩 CUSTOM · 🦴O /);
+  assert.match(row, /^🧩 CUSTOM · caveman off /);
 
   const second = await createRuntime([], EXTENSION_FILES, { sessionId: "session-2" });
   await second.start();
@@ -854,7 +882,7 @@ test("/ts set accepts a camelCase knob typed in any case", async () => {
   await rt.start();
 
   await rt.run("ts", "set autoRtk=off");
-  assert.match(rt.row(), /🔁OFF/);
+  assert.match(rt.row(), /· autoRtk off ·/);
   assert.deepEqual(
     rt.entries.filter((entry) => entry.customType === "ts-mode").map((entry) => entry.data),
     [{ name: "autoRtk", value: "off" }],
@@ -862,7 +890,7 @@ test("/ts set accepts a camelCase knob typed in any case", async () => {
   );
 
   await rt.run("ts", "set AUTORTK=on");
-  assert.match(rt.row(), /🔁ON/);
+  assert.match(rt.row(), /· autoRtk on ·/);
 });
 
 test("/combo keeps the pre-2.0 default verb and refuses the newer knobs", async () => {
@@ -1283,6 +1311,53 @@ test("a preset carries the threshold level", async () => {
   assert.ok(lite.includes("compaction.thresholdPercent=-1"), lite.join(" "));
 });
 
+// `options.threshold` says what a level cannot: an exact share, an exact token cap, and the rule for
+// choosing between them. The host hands a positive `compaction.thresholdTokens` priority over the
+// percent the moment it is set, so "use whichever fires first" has to be decided before the write —
+// and the losing limit is written back to `-1` rather than left in the file to outrank the winner.
+test("options.threshold picks the limit that fires first, and the row reports it", async () => {
+  // 70% of this window is 140000, which is what the `full` level stands for.
+  const rt = await createRuntime([], EXTENSION_FILES, { model: { ...DEEPSEEK, contextWindow: 200000 } });
+  await rt.start();
+  await rt.run("ts", "set threshold=full");
+  stubOmp(rt);
+
+  // A cap below the share wins, and the share is written alongside it for the case where the cap is
+  // later lifted.
+  await rt.run("ts", "option threshold.tokens=100000");
+  rt.clearExecCalls();
+  await rt.run("ts", "native apply");
+  assert.ok(nativeWrites(rt).includes("compaction.thresholdTokens=100000"), nativeWrites(rt).join(" "));
+  assert.ok(nativeWrites(rt).includes("compaction.thresholdPercent=70"));
+  assert.match(rt.row(), /threshold full \(100k\)/, "the row names the limit in force");
+
+  // A cap above it loses the `auto` pick: the share fires first.
+  await rt.run("ts", "option threshold.tokens=160000");
+  rt.clearExecCalls();
+  await rt.run("ts", "native apply");
+  assert.ok(nativeWrites(rt).includes("compaction.thresholdTokens=-1"), nativeWrites(rt).join(" "));
+  assert.match(rt.row(), /threshold full \(70%\)/, "and the row goes back to the share");
+
+  // A pin overrides the comparison in either direction.
+  await rt.run("ts", "option threshold.pick=tokens");
+  rt.clearExecCalls();
+  await rt.run("ts", "native apply");
+  assert.ok(nativeWrites(rt).includes("compaction.thresholdTokens=160000"), nativeWrites(rt).join(" "));
+
+  await rt.run("ts", "option threshold.pick=percent");
+  rt.clearExecCalls();
+  await rt.run("ts", "native apply");
+  assert.ok(nativeWrites(rt).includes("compaction.thresholdTokens=-1"), nativeWrites(rt).join(" "));
+
+  // A share of its own replaces the level's: `full` then writes 40, not 70.
+  await rt.run("ts", "option threshold.percent=40");
+  await rt.run("ts", "option threshold.pick=auto");
+  rt.clearExecCalls();
+  await rt.run("ts", "native apply");
+  assert.ok(nativeWrites(rt).includes("compaction.thresholdPercent=40"), nativeWrites(rt).join(" "));
+  assert.match(rt.row(), /threshold full \(40%\)/);
+});
+
 test("a knob set next to a preset keeps the preset's tier dials and says the state is custom", async () => {
   const rt = await createRuntime();
   await rt.start();
@@ -1348,14 +1423,19 @@ test("bare /combo stays preset-only instead of opening the menu", async () => {
 });
 
 // The row is the UI the pack prints, so the menu configures it directly and previews it: a shape has
-// to be choosable by what it looks like, not by its name.
-test("/ts config configures the footer row and previews each shape", async () => {
+// to be choosable by what it looks like, not by its name — and like every other knob, the pick has to
+// be able to land in the file instead of only in the session.
+test("/ts config configures the footer row, previews each shape, and stores it for new sessions", async () => {
   const asked = [];
   const rt = await createRuntime([], EXTENSION_FILES, {
     select: (title, options) => {
       if (title === "Supreme Token Saver") {
         asked.push("menu");
         return "Footer row";
+      }
+      if (title === "status=names") {
+        asked.push(options.map((option) => option.label));
+        return "New sessions";
       }
       asked.push(options.map((option) => option.label));
       asked.push(options.find((option) => option.label === "names").description);
@@ -1373,7 +1453,27 @@ test("/ts config configures the footer row and previews each shape", async () =>
     /^every knob spelled out: its name and its level, no icons — 🧩 MAX · caveman ultra · rtk on/,
     "the description is the row this shape would render, not a second template"
   );
-  assert.match(rt.row(), /^🧩 MAX · caveman ultra · rtk on · autoRtk on · ponytail ultra · read full/);
+  assert.deepEqual(asked[3], ["This session", "New sessions"], "the row asks where the pick goes");
+  assert.equal(
+    JSON.parse(readFileSync(CONFIG_FILE, "utf8")).modes.status,
+    "names",
+    "the shape is stored, not just applied"
+  );
+
+  const fresh = await createRuntime();
+  await fresh.start();
+  assert.match(fresh.row(), /^🧩 MAX · caveman ultra · rtk on · /, "a new session starts on the stored shape");
+});
+
+// The other scope of the same entry: a session-scoped pick changes the row now and writes nothing.
+test("/ts config applies a footer row shape to this session when asked to", async () => {
+  const picks = ["Footer row", "preset", "This session"];
+  const rt = await createRuntime([], EXTENSION_FILES, { select: () => picks.shift() });
+  await rt.start();
+
+  await rt.run("ts", "config");
+  assert.equal(rt.row(), "🧩 MAX", "the session row took the shape");
+  assert.equal(existsSync(CONFIG_FILE), false, "and nothing was stored for new sessions");
 });
 
 // A config file that does not parse must not be replaced by the next write: reading it yields the
@@ -1435,11 +1535,11 @@ test("/ts set headroom=on routes the session and shows it on the row", async () 
     config: { openai_api_url: DEEPSEEK.baseUrl },
   });
   assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787, "the provider is on the proxy");
-  assert.match(rt.row(), /🔀ON/);
+  assert.match(rt.row(), /headroom on$/);
 
   await rt.run("ts", "set headroom=off");
   assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl, "the provider is back on its own endpoint");
-  assert.match(rt.row(), /🔀OFF/);
+  assert.match(rt.row(), /headroom off$/);
 });
 
 // Every preset carries headroom=off, so applying one on a routed session unroutes it: the knob is part
@@ -1450,11 +1550,11 @@ test("a preset turns the headroom knob off and unroutes", async () => {
   await withProxyHealth(() => rt.run("ts", "set headroom=on"), {
     config: { openai_api_url: DEEPSEEK.baseUrl },
   });
-  assert.match(rt.row(), /🔀ON/);
+  assert.match(rt.row(), /headroom on$/);
 
   await rt.run("ts", "preset max");
   assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl);
-  assert.match(rt.row(), /🔀OFF/);
+  assert.match(rt.row(), /headroom off$/);
 });
 
 // A resumed session was routed by a process that has since ended: the entry still says `on`, so the
@@ -1469,7 +1569,7 @@ test("a session that was left routed re-wraps on session start", async () => {
   }, { config: { openai_api_url: DEEPSEEK.baseUrl } });
 
   assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787, "the wiring is back");
-  assert.match(rt.row(), /🔀ON/);
+  assert.match(rt.row(), /headroom on$/);
 });
 
 // A preset speaks about behaviour; the row's shape is a preference the user set. Applying one must not
@@ -1532,11 +1632,11 @@ test("preset ultra turns headroom on, and the presets below it turn it back off"
     config: { openai_api_url: DEEPSEEK.baseUrl },
   });
   assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787, "ultra routed the session");
-  assert.match(rt.row(), /🔀ON/);
+  assert.match(rt.row(), /headroom on$/);
 
   await rt.run("ts", "preset max");
   assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl, "max unroutes it again");
-  assert.match(rt.row(), /🔀OFF/);
+  assert.match(rt.row(), /headroom off$/);
 });
 
 // Writing a preset for new sessions drops the behaviour overrides that would fight it — but the row's
@@ -1581,14 +1681,14 @@ test("/ts config reaches the same writes as the typed verbs", async () => {
     [{ mode: "off" }],
     "a session-scoped pick writes what `/ts set ponytail=off` writes"
   );
-  assert.match(rt.row(), /🐴O /, "the ponytail token is off, one letter in the default shape");
+  assert.match(rt.row(), /· ponytail off ·/, "the ponytail token is off, spelled out in the default shape");
 
   // The same menu, the other scope: the pick lands in the config file and not in the session.
   const stored = ["Knob", "read", "off", "New sessions"];
   rt.ctx.ui.select = () => stored.shift();
   await rt.run("ts", "config");
   assert.equal(JSON.parse(readFileSync(CONFIG_FILE, "utf8")).modes.read, "off", "stored for new sessions");
-  assert.match(rt.row(), /📖F/, "storing a default leaves the running session alone");
+  assert.match(rt.row(), /· read full ·/, "storing a default leaves the running session alone");
   assert.deepEqual(stored, [], "the menu consumed exactly the selectors it showed");
 });
 
@@ -1610,4 +1710,222 @@ test("/ts config escape lands on nothing", async () => {
   assert.deepEqual(rt.entries, [], "an abandoned menu writes no session entry");
   assert.equal(rt.row(), before, "an abandoned menu leaves the row alone");
   assert.equal(existsSync(CONFIG_FILE), false, "an abandoned menu writes no config");
+});
+
+// --- /ai-addons: where the version comes from, and the startup check -----------------------------
+//
+// The updater is a second extension with its own seams: every version it reads over the network goes
+// through `fetch`, so a stub decides what is published, and the pack's own directory is derived from
+// the module URL — which is why the stamp, the lock file and the plugin root all live in the sandbox.
+
+const AI_ADDONS = join(EXT, "ai-addons-updater", "index.js");
+const PACK_VERSION = JSON.parse(readFileSync(join(EXT, "..", "package.json"), "utf8")).version;
+// The upstream caveman rule, verbatim in the part that matters: it advertises three levels this pack
+// does not have, which is the whole reason the rule is validated before it is injected.
+const UPSTREAM_RULE =
+  "Respond terse like smart caveman. All technical substance stay. Only fluff die.\n\n" +
+  "Switch level: /caveman lite|full|ultra|wenyan-lite|wenyan-full|wenyan-ultra\n" +
+  'Stop: "stop caveman" or "normal mode"\n';
+
+// Every check the updater makes, stubbed. `versions` is mutated by a test that wants newer news.
+function withNetwork(versions = {}) {
+  const previous = globalThis.fetch;
+  const json = (value) => ({ ok: true, status: 200, json: async () => value, text: async () => JSON.stringify(value) });
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes("caveman-activate.md") && versions.caveman) {
+      return { ok: true, status: 200, json: async () => ({}), text: async () => versions.caveman };
+    }
+    if (target.includes("omp-supreme-token-saver/main/package.json") && versions.published) return json({ version: versions.published });
+    if (target.includes("registry.npmjs.org") && versions.npm) return json({ version: versions.npm });
+    if (target.includes("DietrichGebert/ponytail") && versions.ponytail) return json({ version: versions.ponytail });
+    if (target.includes("api.github.com") && versions.rtk) return json({ tag_name: versions.rtk });
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+  };
+  return () => { globalThis.fetch = previous; };
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(predicate, timeout = 3000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await delay(10);
+  }
+  return false;
+}
+
+const addonsState = () => JSON.parse(readFileSync(ADDONS_STATE, "utf8"));
+const ageState = (hours) => writeFileSync(ADDONS_STATE, JSON.stringify({ ...addonsState(), lastCheck: Date.now() - hours * 3600_000 }));
+
+// A session start returns before the check does (that is the point of it), so a test waits for the
+// state file the check writes before it reads the notifications.
+async function startAndWait(rt) {
+  const before = existsSync(ADDONS_STATE) ? addonsState().lastCheck : 0;
+  await rt.start();
+  const ran = await waitFor(() => existsSync(ADDONS_STATE) && addonsState().lastCheck > before);
+  await delay(250);
+  return ran;
+}
+
+const tokenSaverRow = (rt) => rt.notifications.map((n) => n.text).find((text) => text.startsWith("Token saver "));
+
+test("/ai-addons reports the version each source holds, and never a date", async () => {
+  const rt = await createRuntime([], [AI_ADDONS]);
+  const restore = withNetwork({ published: "2.2.0" });
+  try {
+    // Only the package.json the module travels with is there: the plugin layout's last resort, and the
+    // version a repo checkout reports.
+    await rt.run("ai-addons", "check");
+    const row = tokenSaverRow(rt);
+    assert.match(row, new RegExp(`local=${PACK_VERSION} \\(package\\.json\\)`));
+    assert.match(row, /published=2\.2\.0/);
+
+    // A plugin install: the manifest under the plugins root answers for it.
+    mkdirSync(dirname(PLUGIN_MANIFEST), { recursive: true });
+    writeFileSync(PLUGIN_MANIFEST, JSON.stringify({ version: "7.7.7" }));
+    rt.notifications.length = 0;
+    await rt.run("ai-addons", "check");
+    assert.match(tokenSaverRow(rt), /local=7\.7\.7 \(package\.json\)/);
+
+    // The lock file is what omp believes is installed: it outranks the manifest.
+    writeFileSync(LOCK_FILE, JSON.stringify({ plugins: { "@dillydalli3r/omp-supreme-token-saver": { version: "8.8.8" } } }));
+    rt.notifications.length = 0;
+    await rt.run("ai-addons", "check");
+    assert.match(tokenSaverRow(rt), /local=8\.8\.8 \(omp-plugins\.lock\.json\)/);
+
+    // The stamp an install writes into the tree is the most specific of the three.
+    writeFileSync(VERSION_STAMP, JSON.stringify({ version: "9.9.9" }));
+    rt.notifications.length = 0;
+    await rt.run("ai-addons", "check");
+    assert.match(tokenSaverRow(rt), /local=9\.9\.9 \(stamp\)/);
+
+    for (const { text } of rt.notifications) {
+      assert.doesNotMatch(text, /\d{4}-\d{2}-\d{2}/, "a version row never guesses from a date");
+    }
+  } finally { restore(); }
+});
+
+test("the startup check runs once per interval, and only speaks when the news changes", async () => {
+  writeFileSync(VERSION_STAMP, JSON.stringify({ version: "2.1.0" }));
+  const versions = { published: "2.2.0", npm: "2.2.0", caveman: UPSTREAM_RULE };
+  const restore = withNetwork(versions);
+  try {
+    const rt = await createRuntime([], [AI_ADDONS]);
+    assert.equal(await startAndWait(rt), true, "the session start ran the check");
+    assert.equal(rt.notifications.length, 1, "one line for the whole set, not one per add-on");
+    assert.match(rt.notifications[0].text, /^ai-addons: 1 update: tokensaver 2\.1\.0 → 2\.2\.0 — run \/ai-addons update tokensaver/);
+    assert.equal(addonsState().notified, "tokensaver 2.1.0→2.2.0");
+
+    // Inside the interval: no second check, so no second notification.
+    rt.notifications.length = 0;
+    await rt.start();
+    await delay(250);
+    assert.deepEqual(rt.notifications, [], "a second start inside the interval checks nothing");
+
+    // Past the interval with the same news: the check runs again, the notice does not repeat.
+    ageState(7);
+    assert.equal(await startAndWait(rt), true, "the interval elapsed, so the check ran");
+    assert.deepEqual(rt.notifications, [], "an unchanged result is not re-announced");
+
+    // Past the interval with a newer release: the notice comes back.
+    versions.published = "2.4.0";
+    ageState(7);
+    rt.notifications.length = 0;
+    await startAndWait(rt);
+    assert.match(rt.notifications.at(-1).text, /tokensaver 2\.1\.0 → 2\.4\.0/);
+  } finally { restore(); }
+});
+
+test("the startup check says nothing while everything is current", async () => {
+  writeFileSync(VERSION_STAMP, JSON.stringify({ version: "2.2.0" }));
+  // The native gate is on, so the one other line this notice can carry does not apply either.
+  writeFileSync(CONFIG_FILE, JSON.stringify({ version: 2, options: { native: { mode: "auto" } } }));
+  const restore = withNetwork({ published: "2.2.0", npm: "2.2.0", caveman: UPSTREAM_RULE });
+  try {
+    const rt = await createRuntime([], [AI_ADDONS]);
+    assert.equal(await startAndWait(rt), true, "the check ran");
+    assert.deepEqual(rt.notifications, [], "nothing outdated, nothing said");
+    assert.equal(addonsState().notified, "");
+  } finally { restore(); }
+});
+
+test("the startup check points at /ts native on while the preset's native levels are unwritten", async () => {
+  writeFileSync(VERSION_STAMP, JSON.stringify({ version: "2.2.0" }));
+  const restore = withNetwork({ published: "2.2.0", caveman: UPSTREAM_RULE });
+  try {
+    // No config file: a fresh install runs preset max with the native gate at its default `off`.
+    const rt = await createRuntime([], [AI_ADDONS]);
+    await startAndWait(rt);
+    assert.equal(rt.notifications.length, 1, "the gap is one line, once");
+    assert.match(rt.notifications[0].text, /\/ts native on/);
+    assert.match(rt.notifications[0].text, /read\/compress\/prune\/threshold/);
+
+    // The notice is throttled like the check it rides: a restart inside the interval repeats nothing.
+    rt.notifications.length = 0;
+    await rt.start();
+    await delay(250);
+    assert.deepEqual(rt.notifications, []);
+  } finally { restore(); }
+});
+
+test("/ai-addons level off stops the startup check, and on brings it back", async () => {
+  writeFileSync(VERSION_STAMP, JSON.stringify({ version: "2.1.0" }));
+  const restore = withNetwork({ published: "2.2.0", caveman: UPSTREAM_RULE });
+  try {
+    const rt = await createRuntime([], [AI_ADDONS]);
+    await rt.run("ai-addons", "level off");
+    assert.match(rt.notifications.at(-1).text, /startup check off, every 6h/);
+
+    rt.notifications.length = 0;
+    await rt.start();
+    await delay(250);
+    assert.deepEqual(rt.notifications, [], "the check does not run at all");
+    assert.equal(existsSync(ADDONS_STATE), false, "and it writes no state either");
+
+    await rt.run("ai-addons", "level on");
+    assert.match(rt.notifications.at(-1).text, /startup check on, every 6h/);
+  } finally { restore(); }
+});
+
+test("/ts status names the command that makes the native knobs real, and stops once they are", async () => {
+  const rt = await createRuntime();
+  await rt.start();
+  // The process-wide state bridge keeps whatever the previous test left behind, so this session states
+  // the preset it is about rather than inheriting one.
+  await rt.run("ts", "preset max");
+  await rt.run("ts", "status");
+  assert.match(rt.notifications.at(-1).text, /Native knobs: knobs are prompt-level only — \/ts native on/);
+
+  await rt.run("ts", "native on");
+  await rt.run("ts", "status");
+  assert.doesNotMatch(rt.notifications.at(-1).text, /Native knobs:/, "the line goes away once the gate writes");
+});
+
+test("the caveman rule a session is given never names a level /caveman rejects", async () => {
+  const upstreamPath = join(SANDBOX, "upstream-rule.md");
+  writeFileSync(upstreamPath, UPSTREAM_RULE);
+
+  const rt = await createRuntime(
+    [{ type: "custom", customType: "caveman-mode", data: { mode: "full" }, id: "e1" }],
+    [join(EXT, "caveman-session", "index.js")]
+  );
+  await rt.start();
+
+  const previous = process.env.OMP_CAVEMAN_RULE;
+  try {
+    process.env.OMP_CAVEMAN_RULE = join(EXT, "caveman-session", "rule.md");
+    const shipped = await rt.runBeforeAgentStart("base");
+    assert.match(shipped, /Switch level: \/caveman off\|lite\|full\|ultra\|wenyan/);
+
+    // The installer's overwrite: three of those levels are not values this pack has.
+    process.env.OMP_CAVEMAN_RULE = upstreamPath;
+    const overwritten = await rt.runBeforeAgentStart("base");
+    assert.doesNotMatch(overwritten, /wenyan-(lite|full|ultra)/);
+    assert.equal(overwritten, shipped, "an overwritten rule.md injects what the repo ships, byte for byte");
+  } finally {
+    if (previous === undefined) delete process.env.OMP_CAVEMAN_RULE;
+    else process.env.OMP_CAVEMAN_RULE = previous;
+  }
 });

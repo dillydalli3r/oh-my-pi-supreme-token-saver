@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
+  foreignLevels,
   getSharedState,
   isOmpSubagentPrompt,
   normalizeMode,
@@ -11,22 +12,43 @@ import {
 } from "../shared/session-state.js";
 
 const CAVERN_DIR = dirname(fileURLToPath(import.meta.url));
-const RULE_PATH = join(CAVERN_DIR, "rule.md");
 
-const FALLBACK_FULL_RULE = `Respond terse like smart caveman. All technical substance stay. Only fluff die.
+// The rule this pack injects for `full`, byte-identical to the rule.md it ships. The installer may
+// overwrite rule.md with the upstream caveman text on the way in (install-omp-addons.js fetches it
+// from raw.githubusercontent.com), so this copy is the one text no install can change.
+const BUNDLED_RULE = `Respond terse like smart caveman. All technical substance stay. Only fluff die.
 
 Rules:
-- Drop articles (a/an/the), filler (just/really/basically), pleasantries, hedging.
+- Drop: articles (a/an/the), filler (just/really/basically), pleasantries, hedging
 - Fragments OK. Short synonyms. Technical terms exact. Code unchanged.
 - Pattern: [thing] [action] [reason]. [next step].
 - Not: "Sure! I'd be happy to help you with that."
 - Yes: "Bug in auth middleware. Fix:"
 
-Auto-clarity: drop caveman for security warnings, irreversible actions, or when user seems confused. Resume after.`;
+Switch level: /caveman off|lite|full|ultra|wenyan
+Stop: "stop caveman" or "normal mode"
 
-// ponytail: synchronous read each full-mode injection; ceiling = small file, cold session start. Upgrade path: cache file contents + mtime, invalidate on change.
+Auto-Clarity: drop caveman for security warnings, irreversible actions, user confused. Resume after.
+
+Boundaries: code/commits/PRs written normal.
+`;
+
+// Invariant: the injected rule may only name levels `/caveman` accepts (`KNOBS.caveman`, checked by the
+// shared `foreignLevels`). The text the installer fetches upstream advertises
+// `wenyan-lite|wenyan-full|wenyan-ultra` — three values this pack rejects — so which text a session got
+// used to depend on whether that install had network. A rule.md that names a foreign level is therefore
+// not served: the bundled copy is, which makes the online and offline installs inject identical text.
+// (`OMP_CAVEMAN_RULE` points the read elsewhere.)
+function rulePath() {
+  return process.env.OMP_CAVEMAN_RULE || join(CAVERN_DIR, "rule.md");
+}
+
+// ponytail: read plus token scan over a ~600-byte file on each full-mode injection; upgrade path — cache
+// the text and its verdict, invalidate on mtime.
 function readFullRule() {
-  try { return readFileSync(RULE_PATH, "utf8"); } catch { return FALLBACK_FULL_RULE; }
+  let text = null;
+  try { text = readFileSync(rulePath(), "utf8"); } catch { text = null; }
+  return text && foreignLevels(text).length === 0 ? text : BUNDLED_RULE;
 }
 
 const INSTRUCTIONS = {

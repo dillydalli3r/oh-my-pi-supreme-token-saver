@@ -20,9 +20,11 @@ import {
   MODE_KNOBS,
   OPTION_VALUES,
   PRESET_NAMES,
+  THRESHOLD_PERCENT,
   clearConfig,
   canonicalKnob,
   getSharedState,
+  nativeGapHint,
   normalizeMode,
   normalizeOptionValue,
   normalizePreset,
@@ -30,6 +32,8 @@ import {
   readConfig,
   readOptions,
   reconcileSharedEntries,
+  resolveThreshold,
+  sessionContextWindow,
   setSharedListener,
   setSharedMode,
   setSharedPreset,
@@ -139,30 +143,35 @@ const KNOB_NATIVE = Object.freeze({
   // automatic compaction runs after a turn; `-1` is the host's own "no fixed limit" value, where the
   // reserve-based threshold (a 16384-token floor and at least 15% of the window) applies instead, so
   // `off` pins stock behaviour rather than disabling compaction. Percent, not
-  // `compaction.thresholdTokens`: an absolute cap is wrong the moment the session changes model, and
-  // a positive absolute value silently outranks the percent, so this knob leaves it at `-1`.
+  // `compaction.thresholdTokens`, is what a *level* stands for: an absolute cap is wrong the moment
+  // the session changes model, and a positive absolute value silently outranks the percent. Both keys
+  // are still written — the pair the level and `options.threshold` resolve to (see nativeMapping).
   // `compaction.idleThresholdTokens` is absolute because the host key is — the levels are tuned for a
   // ~200k window and want scaling down on a model with a much smaller one. Idle compaction used to be
   // switched on by `prune=ultra` while this token trigger stayed at its 200000 default, which is at or
   // above the whole window of many models, so the setting could never fire: the trigger lives here now.
   threshold: Object.freeze({
     off: Object.freeze({
-      "compaction.thresholdPercent": -1,
+      "compaction.thresholdPercent": THRESHOLD_PERCENT.off,
+      "compaction.thresholdTokens": -1,
       "compaction.idleEnabled": false,
       "compaction.idleThresholdTokens": 200000,
     }),
     lite: Object.freeze({
-      "compaction.thresholdPercent": 85,
+      "compaction.thresholdPercent": THRESHOLD_PERCENT.lite,
+      "compaction.thresholdTokens": -1,
       "compaction.idleEnabled": false,
       "compaction.idleThresholdTokens": 200000,
     }),
     full: Object.freeze({
-      "compaction.thresholdPercent": 70,
+      "compaction.thresholdPercent": THRESHOLD_PERCENT.full,
+      "compaction.thresholdTokens": -1,
       "compaction.idleEnabled": true,
       "compaction.idleThresholdTokens": 120000,
     }),
     ultra: Object.freeze({
-      "compaction.thresholdPercent": 55,
+      "compaction.thresholdPercent": THRESHOLD_PERCENT.ultra,
+      "compaction.thresholdTokens": -1,
       "compaction.idleEnabled": true,
       "compaction.idleThresholdTokens": 80000,
     }),
@@ -233,14 +242,20 @@ function tierOf(state) {
   return PRESET_NATIVE[state.preset] ? state.preset : DEFAULT_PRESET;
 }
 
-// What the running state wants written: the four knobs' keys plus the tier's dials.
-function nativeMapping(state) {
+// What the running state wants written: the four knobs' keys plus the tier's dials. The two
+// compaction limits are the exception to "a level maps to its keys": the level's share and
+// `options.threshold` resolve to a pair, and `auto` decides between a share and a fixed cap by
+// weighing the cap against this session's context window, which no level table can do.
+function nativeMapping(state, contextWindow) {
+  const limits = resolveThreshold(readOptions().threshold, THRESHOLD_PERCENT[state.threshold], contextWindow);
   return {
     ...KNOB_NATIVE.read[state.read],
     ...KNOB_NATIVE.compress[state.compress],
     ...KNOB_NATIVE.prune[state.prune],
     ...KNOB_NATIVE.threshold[state.threshold],
     ...PRESET_NATIVE[tierOf(state)],
+    "compaction.thresholdPercent": limits.percent,
+    "compaction.thresholdTokens": limits.tokens,
   };
 }
 
@@ -595,11 +610,15 @@ function statusText() {
   const state = getSharedState();
   const defaults = readConfig();
   const native = readOptions().native.mode;
+  // One line, only while the gap is real: the four native knobs write nothing into config.yml at the
+  // default gate, so a preset that carries levels is prompt text plus a row until `/ts native on`.
+  const gap = nativeGapHint(state.preset, native);
   return [
     `Token Saver: ${String(state.preset).toUpperCase()}`,
     knobsText(state),
     `Config: ${CONFIG_FILE}`,
     `Native config.yml: ${native}${native === "auto" ? " (follows the knobs and preset)" : " (/ts native apply writes it)"}`,
+    ...(gap ? [`Native knobs: ${gap}`] : []),
     `Default for new sessions: ${String(defaults.preset).toUpperCase()} (${knobsText(defaults.modes)})`,
     "Run /ts help for the command list.",
   ].join("\n");
@@ -743,7 +762,7 @@ export default function tokenSaverExtension(pi) {
       return;
     }
 
-    const mapping = nativeMapping(state);
+    const mapping = nativeMapping(state, sessionContextWindow(ctx));
     const tier = nativeTier(state);
 
     let current;
@@ -786,7 +805,7 @@ export default function tokenSaverExtension(pi) {
     const gate = readOptions().native.mode;
     const state = getSharedState();
     const off = state.preset === NATIVE_OFF;
-    const mapping = nativeMapping(state);
+    const mapping = nativeMapping(state, sessionContextWindow(ctx));
 
     let current;
     try {
@@ -854,28 +873,43 @@ export default function tokenSaverExtension(pi) {
     );
     if (!value) return;
 
-    const scope = await ui.select(`${knob}=${value}`, [
-      { label: "This session", description: "applies now, reloads the session" },
-      { label: "New sessions", description: "stored default; this session is unchanged" },
-    ]);
+    const scope = await pickScope(ui, `${knob}=${value}`);
     if (!scope) return;
 
     if (scope === "This session") await applySet(`${knob}=${value}`, ctx);
     else applyDefault(`${knob}=${value}`, ctx);
   }
 
+  // Where a pick goes. Every knob has both destinations — `/ts set` for the session, `/ts default`
+  // for the file — so the menu asks once, in one vocabulary, instead of one entry that writes and
+  // another that forgets.
+  function pickScope(ui, label) {
+    return ui.select(label, [
+      { label: "This session", description: "applies now, reloads the session" },
+      { label: "New sessions", description: "stored default; this session is unchanged" },
+    ]);
+  }
+
   // The row is the only UI this pack prints, so it gets its own entry instead of hiding one level
-  // deeper under `Knob`; every option carries the row it would actually produce.
+  // deeper under `Knob`; every option carries the row it would actually produce. Then the same
+  // session-or-default choice every other knob gets: a shape picked here used to live only until the
+  // session ended, which is exactly what `/ts default status=<shape>` exists to fix.
   async function menuRow(ui, ctx) {
     const state = getSharedState();
     const shape = await ui.select(
       "Token Saver · the footer row",
       KNOBS.status.map((level) => ({
         label: level,
-        description: `${STATUS_LEVELS[level]} — ${previewRow(state, level) || "(no row)"}`,
+        description: `${STATUS_LEVELS[level]} — ${previewRow(state, level, ctx) || "(no row)"}`,
       }))
     );
-    if (shape) await applySet(`status=${shape}`, ctx);
+    if (!shape) return;
+
+    const scope = await pickScope(ui, `status=${shape}`);
+    if (!scope) return;
+
+    if (scope === "This session") await applySet(`status=${shape}`, ctx);
+    else applyDefault(`status=${shape}`, ctx);
   }
 
   async function menuDefault(ui, ctx) {
@@ -1185,6 +1219,10 @@ export default function tokenSaverExtension(pi) {
 
     const result = writeConfig({ options: { [group]: { [key]: value } } });
     if (!reportWrite(ctx, result)) return;
+    // An option is read live, so one that changes what a knob means changes the row too: the
+    // threshold limits are the pair the `threshold` token reports, and the row would otherwise keep
+    // describing the previous setting until something else republished the state.
+    if (group === "threshold") render(ctx);
     notify(
       ctx,
       `${group}.${key} = ${JSON.stringify(result.config.options[group][key])} · Config: ${CONFIG_FILE}\n` +
