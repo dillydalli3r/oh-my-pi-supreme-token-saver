@@ -111,7 +111,7 @@ The installer never writes OMP's native settings — that layer is opt-in (see
 | 2 | `extensions/caveman-session/index.js` | `/caveman`, and the rule injected for `full` |
 | 3 | `extensions/rtk-session/index.js` | `/rtk`, `/rtk auto`, and the bash rewrite |
 | 4 | `extensions/token-saver/index.js` | `/token-saver` (`/ts`), `/combo`, presets, the native driver |
-| 5 | `extensions/ai-addons-updater/index.js` | `/ai-addons` — version checks, the startup notice, updates |
+| 5 | `extensions/ai-addons-updater/index.js` | `/ai-addons` — version checks and updates |
 | 6 | `extensions/amanai-reward/index.js` | the passive reward-key detector |
 
 A non-empty `omp.extensions` array is authoritative: a module missing from that list is a silently
@@ -199,7 +199,6 @@ Individual add-ons:
 /ponytail [lite|full|ultra|off|status]         provided by the Ponytail plugin, not by this repo
 /ai-addons <check|status>                      installed vs published version, per add-on
 /ai-addons update <ponytail|rtk|caveman|tokensaver|all> [--dry-run]
-/ai-addons level [on|off]                      the session-start update check (see below)
 ```
 
 `tokensaver` is compared by version, not by date: the row reads the installed version from the tree's
@@ -239,34 +238,19 @@ run, or an RPC client (`hasUI: false`) prints the typed verb list instead. What 
 value a hand-edited `~/.omp/agent/token-saver.json` would hold, so the file and the menu stay
 interchangeable.
 
-## Startup update check
+## Version check
 
-`extensions/ai-addons-updater/index.js` runs the same check `/ai-addons check` runs — once, off the
-turn, at most once per stored interval. It never blocks startup: the `session_start` handler returns
-immediately and the check resolves in the background, so a slow or unreachable GitHub cannot delay the
-first prompt.
+`extensions/ai-addons-updater/index.js` checks the four dependencies — Ponytail, the `rtk` binary, the
+caveman rule and this pack — on demand only: `/ai-addons check`. It registers no `session_start` hook,
+because a notice tells you something and a launch print is noise; the same reasoning removed the
+session-start notices from `/rtk` and `/caveman`, which report through the footer row instead.
 
-- **Throttle.** `ai-addons-state.json` holds `lastCheck`; anything inside the interval (default 6h)
-  returns without a network call. The timestamp is written *before* the fetch, so a machine that is
-  offline at every start does not re-attempt the whole set on every session.
-- **One line, when it is news.** Nothing is said while every add-on is current. When something is
-  outdated the notice names each one and the exact command to run, e.g.
-  `ai-addons: 1 update: tokensaver 2.1.0 → 2.2.0 — run /ai-addons update tokensaver`. The same result is
-  not announced twice: the state file also stores the signature of what was announced, so restarting
-  a session does not repeat a nag no new release stands behind.
-- **The native gap, named once.** The `read` / `compress` / `prune` / `threshold` knobs reach OMP's own
-  settings only when `options.native.mode` is `auto`, and that gate stays `off` by default — writing
-  `config.yml` is opt-in. While a session runs preset `high`, `max` or `ultra` with the gate off, the
-  notice carries one extra line naming `/ts native on`. `/ts status` prints the same line (`Native knobs:
-  …`) so it is there whenever it is asked for, and it disappears the moment the gate writes.
-- **Off switch.** `/ai-addons level on|off` stores it; `level` alone reports it.
+Deleting the startup check deleted its whole apparatus with it: the interval throttle, the
+`ai-addons-state.json` state file, the `ai-addons.json` switch, and `/ai-addons level on|off`. A session
+that never runs `/ai-addons` now never pays for a fetch, and there is no second file to keep in step.
 
-| File | What it holds |
-|---|---|
-| `~/.omp/agent/ai-addons.json` | `{"checkOnStart": true, "intervalHours": 6}` — the switch and the interval |
-| `~/.omp/agent/ai-addons-state.json` | `{"lastCheck": …, "notified": "<signature>"}` |
-
-Both sit next to `token-saver.json`, so `OMP_TOKEN_SAVER_CONFIG` moves them with it.
+The native gap the notice used to carry (`/ts native on` while a preset's levels are unwritten) is
+unchanged: `/ts status` prints the same line, whenever it is asked for.
 
 **Version sources.** The installed version is read from the most specific source that answers, and
 reported as `unknown` when none does:
@@ -499,7 +483,9 @@ Three details that make it behave like a setting rather than a command:
 - **The row shows what is routed, not what was asked for.** The knob's value in the row is the *effective*
   state: a wrap that failed (no headroom installed, no upstream flag for this provider's family, a proxy on the
   port pointed elsewhere) publishes `off` and says why. The session *entry* keeps your intent, so a resumed
-  session retries once at session start.
+  session retries once at session start — and that retry is silent when it succeeds, because the row is already
+  saying `ON`; only a refusal prints, and the six-line report (`omp → proxy → upstream`, `Undo: …`) belongs to
+  the `/ts headroom wrap` you typed.
 - **`ultra` turns it on, every other preset turns it off** (including `max`, the default for new sessions). A
   preset is a token dial, so only the most aggressive one reaches for the extra process; on a machine without
   Headroom the wrap fails, the row stays `OFF` and the reason is reported. `off` unroutes a routed session.
@@ -607,7 +593,7 @@ Environment overrides:
 
 | Variable | Overrides |
 |---|---|
-| `OMP_TOKEN_SAVER_CONFIG` | Path of `token-saver.json`; the updater's `ai-addons.json` and `ai-addons-state.json` follow its directory |
+| `OMP_TOKEN_SAVER_CONFIG` | Path of `token-saver.json` |
 | `OMP_COMBO_DEFAULTS_FILE` | Path of the legacy `combo-defaults.json` |
 | `OMP_PONYTAIL_PACKAGE_DIR` | Location of the Ponytail plugin package (default reading/writing of its `defaultMode`) |
 | `OMP_HEADROOM_STATE` | Path of the headroom wrap state (`headroom.json`); the proxy log follows the agent dir |
@@ -662,11 +648,9 @@ How a knob is written in the `full` row:
 | Shared modules (`session-state.js`, `status-line.js`, `mode-reinforcement.js`) | `~/.omp/agent/extensions/shared/` |
 | Caveman extension | `~/.omp/agent/extensions/caveman-session/` |
 | RTK extension | `~/.omp/agent/extensions/rtk-session/` |
-| Updater extension (`/ai-addons`, startup check) | `~/.omp/agent/extensions/ai-addons-updater/` |
+| Updater extension (`/ai-addons`) | `~/.omp/agent/extensions/ai-addons-updater/` |
 | Amanai reward detector | `~/.omp/agent/extensions/amanai-reward/` |
 | Installed version stamp (read by the check; absent on a plugin install) | `~/.omp/agent/extensions/.omp-token-saver-version` |
-| Startup check switch and interval | same directory as `token-saver.json` — `~/.omp/agent/ai-addons.json` |
-| Startup check state (`lastCheck`, `notified`) | same directory as `token-saver.json` — `~/.omp/agent/ai-addons-state.json` |
 | The same six modules, marketplace layout | `~/.omp/plugins/node_modules/@dillydalli3r/omp-supreme-token-saver/extensions/` (per `package.json` `omp.extensions`) |
 | Marketplace install record | `~/.omp/plugins/omp-plugins.lock.json`, `~/.omp/plugins/installed_plugins.json` |
 | Ponytail plugin | `~/.omp/plugins/node_modules/@dietrichgebert/ponytail/` |
@@ -693,14 +677,6 @@ with network access and one without inject the same text. `/ai-addons check` rep
 `Caveman rule: serving the bundled rule — the published rule names wenyan-lite, …`, and
 `/ai-addons update caveman` refuses to write the upstream copy. To inject your own rule, edit
 `extensions/caveman-session/rule.md` and keep it to `off|lite|full|ultra|wenyan`.
-
-### The startup notice never appears (or appears every session)
-
-It only speaks when something is actually outdated — or while a preset's native levels are unwritten
-and the gate is `off`. If it stays silent when you expect news, check `/ai-addons check`: the notice is
-throttled to `intervalHours` (default 6h) and remembers the last result it announced, so a restart does
-not repeat it. `/ai-addons level` prints the switch and the interval, `/ai-addons level off` stops it
-entirely, and deleting `~/.omp/agent/ai-addons-state.json` forces the next session to check again.
 
 ### `Token saver version unknown` in the check row
 

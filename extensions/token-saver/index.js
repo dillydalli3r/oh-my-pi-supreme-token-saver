@@ -704,8 +704,9 @@ export default function tokenSaverExtension(pi) {
     watchBranch(ctx);
     // A resumed session whose entries say `headroom=on` was left unrouted by the process that ended:
     // the knob is session state, the wiring is not. `void` because this handler is sync and the wrap
-    // reports every outcome itself.
-    void syncHeadroom(ctx);
+    // reports every outcome itself. Quiet: a start that silently re-established the routing the row
+    // already shows needs no banner — only a refusal (wrong upstream, proxy down) is worth a line.
+    void syncHeadroom(ctx, undefined, { quiet: true });
   }
 
   // --- native settings ---------------------------------------------------------------------
@@ -1054,7 +1055,7 @@ export default function tokenSaverExtension(pi) {
       const routed = route.baseUrl === proxyBaseUrl(port, route.family);
       if (!options.force && headroomAttempted === intent) return;
       headroomAttempted = intent;
-      if (intent === "on" && !routed) await headroomWrap(ctx);
+      if (intent === "on" && !routed) await headroomWrap(ctx, options);
       else if (intent === "off" && routed) await headroomUnwrap(ctx);
     } catch (error) {
       notify(ctx, `Headroom: ${shortError(error)}`, "warning");
@@ -1264,7 +1265,9 @@ export default function tokenSaverExtension(pi) {
   // for whichever provider/family this session is on.
   // Wraps and reports the outcome as a boolean, so the caller owns the one place that publishes the
   // knob's effective value: every failure path here ends unrouted, and the row has to say so.
-  async function performWrap(ctx) {
+  // `quiet` suppresses only the success banner — a session that re-wraps itself on start needs no
+  // narration (the row carries the state), while every refusal still has to be visible.
+  async function performWrap(ctx, options = {}) {
     const route = sessionRoute(ctx);
     if (!route) {
       notify(ctx, "No model is resolved for this session yet, so there is nothing to route.", "warning");
@@ -1346,22 +1349,24 @@ export default function tokenSaverExtension(pi) {
       at: new Date().toISOString(),
     });
 
-    notify(
-      ctx,
-      `Headroom: ${route.provider} now routes through the proxy.\n` +
-        `omp → ${proxyBase} → ${route.baseUrl}\n` +
-        `Registry override: written · session model switched: ${switched ? "yes" : "no"}` +
-        `\nRouting read back from the registry: ${routed ? `yes (${live.baseUrl})` : `NO — still ${live?.baseUrl || "unset"}`}` +
-        `\nProxy: ${started ? "started by the pack" : `reused the one already on ${port}`}` +
-        `\nUndo: /ts headroom unwrap`,
-      routed ? "info" : "warning"
-    );
+    if (!options.quiet || !routed) {
+      notify(
+        ctx,
+        `Headroom: ${route.provider} now routes through the proxy.\n` +
+          `omp → ${proxyBase} → ${route.baseUrl}\n` +
+          `Registry override: written · session model switched: ${switched ? "yes" : "no"}` +
+          `\nRouting read back from the registry: ${routed ? `yes (${live.baseUrl})` : `NO — still ${live?.baseUrl || "unset"}`}` +
+          `\nProxy: ${started ? "started by the pack" : `reused the one already on ${port}`}` +
+          `\nUndo: /ts headroom unwrap`,
+        routed ? "info" : "warning"
+      );
+    }
     return routed;
   }
 
   // The knob's effective value is published in exactly one place: whatever the wrap managed to do.
-  async function headroomWrap(ctx) {
-    const routed = await performWrap(ctx);
+  async function headroomWrap(ctx, options) {
+    const routed = await performWrap(ctx, options);
     setSharedMode("headroom", routed ? "on" : "off");
     return routed;
   }

@@ -23,8 +23,6 @@ const PONYTAIL_STUB = join(PONYTAIL_DIR, "stub-default.json");
 const HEADROOM_STATE = join(SANDBOX, "headroom.json");
 // The updater keeps its own files beside the pack's config, and resolves the installed version from a
 // stamp, the marketplace lock file and the plugin directory — all three pointed into the sandbox.
-const ADDONS_CONFIG = join(SANDBOX, "ai-addons.json");
-const ADDONS_STATE = join(SANDBOX, "ai-addons-state.json");
 const VERSION_STAMP = join(SANDBOX, "token-saver-version");
 const PLUGINS_ROOT = join(SANDBOX, "xdg", "omp", "plugins");
 const LOCK_FILE = join(PLUGINS_ROOT, "omp-plugins.lock.json");
@@ -65,7 +63,7 @@ after(() => rmSync(SANDBOX, { recursive: true, force: true }));
 const clearSandboxFiles = () => {
   for (const file of [
     CONFIG_FILE, LEGACY_DEFAULTS_FILE, PONYTAIL_STUB, HEADROOM_STATE,
-    ADDONS_CONFIG, ADDONS_STATE, VERSION_STAMP, LOCK_FILE, PLUGIN_MANIFEST,
+    VERSION_STAMP, LOCK_FILE, PLUGIN_MANIFEST,
   ]) rmSync(file, { force: true });
 };
 
@@ -1570,6 +1568,29 @@ test("a session that was left routed re-wraps on session start", async () => {
 
   assert.equal(rt.ctx.models.current().baseUrl, PROXY_8787, "the wiring is back");
   assert.match(rt.row(), /headroom on$/);
+  assert.equal(
+    rt.notifications.some((entry) => /now routes through the proxy/.test(entry.text)),
+    false,
+    "a start that rebuilt the routing the row already shows says nothing"
+  );
+});
+
+// Silencing the start must not swallow a refusal: the one case a launch banner still earns its lines
+// is the proxy on the port forwarding this provider's traffic somewhere else.
+test("a start that cannot route still reports why", async () => {
+  const branch = [{ type: "custom", customType: "ts-mode", data: { name: "headroom", value: "on" }, id: "e1" }];
+  const rt = await createRuntime(branch, EXTENSION_FILES, { model: DEEPSEEK });
+
+  await withProxyHealth(async () => {
+    await rt.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }, { config: { openai_api_url: "https://api.openai.com/v1" } });
+
+  const refusal = rt.notifications.at(-1);
+  assert.equal(refusal.type, "warning");
+  assert.match(refusal.text, /already up on 8787 forwarding openai_api_url to https:\/\/api\.openai\.com\/v1/);
+  assert.equal(rt.ctx.models.current().baseUrl, DEEPSEEK.baseUrl, "nothing was rerouted");
+  assert.match(rt.row(), /headroom off$/, "the knob publishes what actually happened");
 });
 
 // A preset speaks about behaviour; the row's shape is a preference the user set. Applying one must not
@@ -1712,7 +1733,7 @@ test("/ts config escape lands on nothing", async () => {
   assert.equal(existsSync(CONFIG_FILE), false, "an abandoned menu writes no config");
 });
 
-// --- /ai-addons: where the version comes from, and the startup check -----------------------------
+// --- /ai-addons: where the version comes from ----------------------------------------------------
 //
 // The updater is a second extension with its own seams: every version it reads over the network goes
 // through `fetch`, so a stub decides what is published, and the pack's own directory is derived from
@@ -1743,30 +1764,6 @@ function withNetwork(versions = {}) {
     return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
   };
   return () => { globalThis.fetch = previous; };
-}
-
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function waitFor(predicate, timeout = 3000) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    if (predicate()) return true;
-    await delay(10);
-  }
-  return false;
-}
-
-const addonsState = () => JSON.parse(readFileSync(ADDONS_STATE, "utf8"));
-const ageState = (hours) => writeFileSync(ADDONS_STATE, JSON.stringify({ ...addonsState(), lastCheck: Date.now() - hours * 3600_000 }));
-
-// A session start returns before the check does (that is the point of it), so a test waits for the
-// state file the check writes before it reads the notifications.
-async function startAndWait(rt) {
-  const before = existsSync(ADDONS_STATE) ? addonsState().lastCheck : 0;
-  await rt.start();
-  const ran = await waitFor(() => existsSync(ADDONS_STATE) && addonsState().lastCheck > before);
-  await delay(250);
-  return ran;
 }
 
 const tokenSaverRow = (rt) => rt.notifications.map((n) => n.text).find((text) => text.startsWith("Token saver "));
@@ -1804,88 +1801,6 @@ test("/ai-addons reports the version each source holds, and never a date", async
     for (const { text } of rt.notifications) {
       assert.doesNotMatch(text, /\d{4}-\d{2}-\d{2}/, "a version row never guesses from a date");
     }
-  } finally { restore(); }
-});
-
-test("the startup check runs once per interval, and only speaks when the news changes", async () => {
-  writeFileSync(VERSION_STAMP, JSON.stringify({ version: "2.1.0" }));
-  const versions = { published: "2.2.0", npm: "2.2.0", caveman: UPSTREAM_RULE };
-  const restore = withNetwork(versions);
-  try {
-    const rt = await createRuntime([], [AI_ADDONS]);
-    assert.equal(await startAndWait(rt), true, "the session start ran the check");
-    assert.equal(rt.notifications.length, 1, "one line for the whole set, not one per add-on");
-    assert.match(rt.notifications[0].text, /^ai-addons: 1 update: tokensaver 2\.1\.0 → 2\.2\.0 — run \/ai-addons update tokensaver/);
-    assert.equal(addonsState().notified, "tokensaver 2.1.0→2.2.0");
-
-    // Inside the interval: no second check, so no second notification.
-    rt.notifications.length = 0;
-    await rt.start();
-    await delay(250);
-    assert.deepEqual(rt.notifications, [], "a second start inside the interval checks nothing");
-
-    // Past the interval with the same news: the check runs again, the notice does not repeat.
-    ageState(7);
-    assert.equal(await startAndWait(rt), true, "the interval elapsed, so the check ran");
-    assert.deepEqual(rt.notifications, [], "an unchanged result is not re-announced");
-
-    // Past the interval with a newer release: the notice comes back.
-    versions.published = "2.4.0";
-    ageState(7);
-    rt.notifications.length = 0;
-    await startAndWait(rt);
-    assert.match(rt.notifications.at(-1).text, /tokensaver 2\.1\.0 → 2\.4\.0/);
-  } finally { restore(); }
-});
-
-test("the startup check says nothing while everything is current", async () => {
-  writeFileSync(VERSION_STAMP, JSON.stringify({ version: "2.2.0" }));
-  // The native gate is on, so the one other line this notice can carry does not apply either.
-  writeFileSync(CONFIG_FILE, JSON.stringify({ version: 2, options: { native: { mode: "auto" } } }));
-  const restore = withNetwork({ published: "2.2.0", npm: "2.2.0", caveman: UPSTREAM_RULE });
-  try {
-    const rt = await createRuntime([], [AI_ADDONS]);
-    assert.equal(await startAndWait(rt), true, "the check ran");
-    assert.deepEqual(rt.notifications, [], "nothing outdated, nothing said");
-    assert.equal(addonsState().notified, "");
-  } finally { restore(); }
-});
-
-test("the startup check points at /ts native on while the preset's native levels are unwritten", async () => {
-  writeFileSync(VERSION_STAMP, JSON.stringify({ version: "2.2.0" }));
-  const restore = withNetwork({ published: "2.2.0", caveman: UPSTREAM_RULE });
-  try {
-    // No config file: a fresh install runs preset max with the native gate at its default `off`.
-    const rt = await createRuntime([], [AI_ADDONS]);
-    await startAndWait(rt);
-    assert.equal(rt.notifications.length, 1, "the gap is one line, once");
-    assert.match(rt.notifications[0].text, /\/ts native on/);
-    assert.match(rt.notifications[0].text, /read\/compress\/prune\/threshold/);
-
-    // The notice is throttled like the check it rides: a restart inside the interval repeats nothing.
-    rt.notifications.length = 0;
-    await rt.start();
-    await delay(250);
-    assert.deepEqual(rt.notifications, []);
-  } finally { restore(); }
-});
-
-test("/ai-addons level off stops the startup check, and on brings it back", async () => {
-  writeFileSync(VERSION_STAMP, JSON.stringify({ version: "2.1.0" }));
-  const restore = withNetwork({ published: "2.2.0", caveman: UPSTREAM_RULE });
-  try {
-    const rt = await createRuntime([], [AI_ADDONS]);
-    await rt.run("ai-addons", "level off");
-    assert.match(rt.notifications.at(-1).text, /startup check off, every 6h/);
-
-    rt.notifications.length = 0;
-    await rt.start();
-    await delay(250);
-    assert.deepEqual(rt.notifications, [], "the check does not run at all");
-    assert.equal(existsSync(ADDONS_STATE), false, "and it writes no state either");
-
-    await rt.run("ai-addons", "level on");
-    assert.match(rt.notifications.at(-1).text, /startup check on, every 6h/);
   } finally { restore(); }
 });
 

@@ -1,10 +1,10 @@
-// OMP extension: /ai-addons — version check, startup update notice and manual updater for Ponytail,
+// OMP extension: /ai-addons — version check and manual updater for Ponytail,
 // RTK, Caveman and this pack. Built-in Node modules only.
 // ponytail: `skipped: none` — semantics match one-liner: fetch + compare + run install.
 // rtk: `skipped: signature verification` — checksums.txt ships only SHA256 of release assets; add sigchain when upstream publishes a signing key.
 // caveman: `skipped: none` — exactly the ask: write rule.md, report old/new hash.
 // tokensaver: `skipped: direct writes` — the pack owns its own installer, we only spawn it.
-// startup: `skipped: backoff` — a fixed interval, not an exponential one; the notice is one line per interval.
+// startup: `deleted` — a startup notice is a launch print; the check is on demand only.
 
 import https from "node:https";
 import { createHash } from "node:crypto";
@@ -14,7 +14,7 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { foreignLevels, nativeGapHint, readConfig, readOptions } from "../shared/session-state.js";
+import { foreignLevels, readConfig } from "../shared/session-state.js";
 
 const IS_WINDOWS = process.platform === "win32";
 const HOME = os.homedir();
@@ -45,14 +45,6 @@ const PACK_MANIFEST_REMOTE = `https://raw.githubusercontent.com/${PACKAGE_REPO}/
 const PACK_NPM_LATEST = `https://registry.npmjs.org/${PACKAGE_NAME.replace("/", "%2F")}/latest`;
 const PACK_GIT_SOURCE = `github:${PACKAGE_REPO}`;
 const PACK_NPM_SPEC = `${PACKAGE_NAME}@latest`;
-
-// Same resolution as shared/session-state.js, so a session pointed at another file by
-// OMP_TOKEN_SAVER_CONFIG checks the pack it actually runs. This extension's own files sit beside it.
-const TS_CONFIG =
-  process.env.OMP_TOKEN_SAVER_CONFIG || path.join(HOME, ".omp", "agent", "token-saver.json");
-const CONFIG_PATH = path.join(path.dirname(TS_CONFIG), "ai-addons.json");
-const STATE_PATH = path.join(path.dirname(TS_CONFIG), "ai-addons-state.json");
-const DEFAULT_STARTUP = { checkOnStart: true, intervalHours: 6 };
 
 // Version stamp the installer may drop into the installed tree (README: "Version sources"). Absent is
 // normal — the marketplace lock file and the pack's own package.json answer for the plugin layout.
@@ -157,11 +149,6 @@ function ponytailManifest() {
 
 async function readJsonFile(file) {
   try { return JSON.parse(await fs.readFile(file, "utf8")); } catch { return null; }
-}
-
-async function writeJsonFile(file, value) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
 // --- versions ----------------------------------------------------------------------------------
@@ -370,48 +357,7 @@ async function checkAddons(ctx) {
   return rows.map((row) => row.row).join("\n");
 }
 
-// --- startup check -----------------------------------------------------------------------------
-
-async function loadStartupConfig() {
-  const raw = (await readJsonFile(CONFIG_PATH)) || {};
-  return {
-    checkOnStart: raw.checkOnStart !== false,
-    intervalHours: Number.isFinite(raw.intervalHours) && raw.intervalHours > 0
-      ? raw.intervalHours
-      : DEFAULT_STARTUP.intervalHours,
-  };
-}
-
-// Startup runs off the turn and at most once per interval. Two layers keep it quiet: `lastCheck` gates
-// the network, and `notified` remembers the signature of what was announced, so a restarted session does
-// not repeat a nag no new release stands behind.
-async function runStartupCheck(ctx) {
-  const config = await loadStartupConfig();
-  if (!config.checkOnStart) return;
-
-  const state = (await readJsonFile(STATE_PATH)) || {};
-  if (Date.now() - (Number(state.lastCheck) || 0) < config.intervalHours * 3600_000) return;
-  // The timestamp is written before the fetch: a machine that is offline at every start must not
-  // re-attempt the whole set on every session.
-  await writeJsonFile(STATE_PATH, { ...state, lastCheck: Date.now() });
-
-  const rows = await collectChecks();
-  const stale = rows.filter((row) => row.update);
-  const signature = stale.map((row) => `${row.id} ${row.local}→${row.remote}`).join("|");
-  if (stale.length && state.notified === signature) return;
-
-  const lines = [];
-  if (stale.length) {
-    const count = `${stale.length} update${stale.length === 1 ? "" : "s"}`;
-    lines.push(`${count}: ${stale.map((row) => `${row.id} ${row.local} → ${row.remote}`).join(", ")}` +
-      ` — run ${stale.map((row) => `/ai-addons update ${row.id}`).join(" | ")}`);
-  }
-  const hint = nativeGapHint(readConfig().preset, readOptions().native.mode);
-  if (hint) lines.push(hint);
-
-  await writeJsonFile(STATE_PATH, { lastCheck: Date.now(), notified: signature });
-  if (lines.length) notify(ctx, `ai-addons: ${lines.join(" · ")}`, stale.length ? "warning" : "info");
-}
+// --- updates -----------------------------------------------------------------------------------
 
 async function updatePonytail(pi, ctx, dryRun = false) {
   const pluginsDir = path.join(HOME, ".omp", "plugins");
@@ -708,10 +654,10 @@ async function updateTokenSaver(pi, ctx, dryRun = false) {
 export default function aiAddonsUpdaterExtension(pi) {
   pi.setLabel?.("AI add-ons updater");
 
-  const USAGE = "/ai-addons <check|status|update ponytail|rtk|caveman|tokensaver|all|level on|off> [--dry-run]";
+  const USAGE = "/ai-addons <check|status|update ponytail|rtk|caveman|tokensaver|all> [--dry-run]";
 
   pi.registerCommand("ai-addons", {
-    description: "Check or update AI add-ons (ponytail/rtk/caveman/tokensaver/all) and the startup notice. Usage: " + USAGE,
+    description: "Check or update AI add-ons (ponytail/rtk/caveman/tokensaver/all). Usage: " + USAGE,
     handler: async (args, ctx) => {
       const arg = String(args || "").trim().toLowerCase();
       const parts = arg.split(/\s+/).filter(Boolean);
@@ -723,21 +669,6 @@ export default function aiAddonsUpdaterExtension(pi) {
         const summary = await checkAddons(ctx);
         notify(ctx, "ai-addons check complete.", "info");
         return summary;
-      }
-      // The startup notice is a stored preference like the suite's `/omp-addons level`: `off` stops the
-      // session-start check without removing the command.
-      if (sub === "level") {
-        if (cleanParts[1] === "on" || cleanParts[1] === "off") {
-          await writeJsonFile(CONFIG_PATH, {
-            ...((await readJsonFile(CONFIG_PATH)) || {}),
-            checkOnStart: cleanParts[1] === "on",
-          });
-        }
-        const config = await loadStartupConfig();
-        const m = `ai-addons: startup check ${config.checkOnStart ? "on" : "off"}, ` +
-          `every ${config.intervalHours}h (${CONFIG_PATH})`;
-        notify(ctx, m, "info");
-        return m;
       }
       if (sub === "update" && cleanParts[1]) {
         const target = cleanParts.slice(1).join(" ");
@@ -768,10 +699,5 @@ export default function aiAddonsUpdaterExtension(pi) {
       notify(ctx, `Usage: ${USAGE}`, "warning");
       return USAGE;
     },
-  });
-
-  pi.on("session_start", (_event, ctx) => {
-    // Fire and forget: the handler resolves immediately, so startup is never gated on GitHub.
-    runStartupCheck(ctx).catch(() => {});
   });
 }

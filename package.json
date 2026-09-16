@@ -1,7 +1,7 @@
 {
   "name": "@dillydalli3r/omp-supreme-token-saver",
-  "version": "2.2.0",
-  "description": "Nine token-saving knobs for OMP — caveman replies, RTK shell compaction, ponytail code minimalism, auto-RTK, compaction-trigger timing, and a unified status row — driven by six presets from off to ultra. The pack selects OMP's own shellMinimizer, compaction and read.summarize settings and layers prompt-level add-ons on top; it ships no compressor of its own. Also includes one /token-saver command surface, a startup update check, a manual updater, and a first-run defaults file.",
+  "version": "2.3.0",
+  "description": "Nine token-saving knobs for OMP — caveman replies, RTK shell compaction, ponytail code minimalism, auto-RTK, compaction-trigger timing, and a unified status row — driven by six presets from off to ultra. The pack selects OMP's own shellMinimizer, compaction and read.summarize settings and layers prompt-level add-ons on top; it ships no compressor of its own. Also includes one /token-saver command surface, a manual updater, and a first-run defaults file.",
   "keywords": [
     "omp",
     "oh-my-pi",
