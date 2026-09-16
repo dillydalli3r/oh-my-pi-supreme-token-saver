@@ -421,11 +421,16 @@ async function rewriteConfigLines(configPath, transform, options = {}) {
 
   // Re-parsed after the write because that is the state omp will actually load. A file that no
   // longer reads back as an extensions sequence loads zero extensions, which is worse than not
-  // having written at all, so the backup goes back.
+  // having written at all, so the previous text goes back through the same temp+rename — the file
+  // ends byte-identical to what this call found, even if the one-time .bak is older than that.
   if (!extensionsSectionIsLoadable(text)) {
-    if (hadFile) await fs.copyFile(backupPath, configPath);
-    else await fs.rm(configPath, { force: true });
-    console.error(`  [fail] Rewriting ${configPath} would leave an unreadable extensions section — restored the previous file.`);
+    if (hadFile) {
+      await fs.writeFile(tempPath, raw, "utf8");
+      await fs.rename(tempPath, configPath);
+    } else {
+      await fs.rm(configPath, { force: true });
+    }
+    console.error(`  [fail] Rewriting ${configPath} would leave an unreadable extensions section — restored the previous file (backup: ${backupPath}).`);
     console.error("  [hint] Fix the `extensions:` block in config.yml (it must be a list of paths) and re-run.");
     process.exitCode = 1;
     return false;
