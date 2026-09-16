@@ -47,6 +47,8 @@ function run(args, { home, cwd }) {
       HOME: home,
       USERPROFILE: home,
       XDG_CONFIG_HOME: join(home, "xdg-config"),
+      // Empty on purpose: the plugin root has to resolve to the temp HOME, not this machine's.
+      XDG_DATA_HOME: "",
       APPDATA: join(home, "appdata"),
       OMP_TOKEN_SAVER_CONFIG: join(home, "token-saver.json"),
     },
@@ -89,6 +91,8 @@ function snapshot(dir) {
 const MANAGED_DIRS = ["caveman-session", "rtk-session", "token-saver", "ai-addons-updater", "shared", "amanai-reward"];
 // A project-scope install replays four steps plus the updater step: token-saver is user-level only.
 const PROJECT_DIRS = ["caveman-session", "rtk-session", "ai-addons-updater", "shared", "amanai-reward"];
+// The name the runtime keys the plugin lock by; the rename in flight does not change the test's point.
+const PACKAGE_NAME = "@dillydalli3r/omp-supreme-token-saver";
 
 test("a dry-run install proposes the same config.yml change twice and writes nothing", () => {
   const { home, cwd } = sandbox();
@@ -289,10 +293,16 @@ test("doctor reports a drifted file as drift, not as installed", () => {
   const { home, cwd } = sandbox();
   seedTree(userExtDir(home), ["caveman-session"]);
   seedFile(join(userExtDir(home), "caveman-session", "rule.md"), "an older rule\n");
+  // The plugin lock is one of the runtime's version sources; doctor has to read the same one.
+  seedFile(
+    join(home, ".omp", "plugins", "omp-plugins.lock.json"),
+    `${JSON.stringify({ plugins: { [PACKAGE_NAME]: { version: "9.9.9" } } })}\n`,
+  );
 
   const result = run(["doctor"], { home, cwd });
 
   assert.equal(result.code, 1, result.out);
   assert.match(result.out, /Caveman rule\.md: drift/);
   assert.match(result.out, /Caveman extension: MISSING/);
+  assert.match(result.out, /Installed version: 9\.9\.9 \(omp-plugins\.lock\.json\)/);
 });

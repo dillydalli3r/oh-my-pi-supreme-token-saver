@@ -1057,17 +1057,26 @@ function parseVersionStamp(raw) {
   }
 }
 
+// The runtime resolves the plugin root as $XDG_DATA_HOME/omp/plugins when that directory exists and
+// ~/.omp/plugins otherwise, so doctor asks the same question instead of reporting "unknown" for a
+// lock file it never looked at.
+async function pluginsRoot(homePluginsDir) {
+  const xdg = process.env.XDG_DATA_HOME && path.join(process.env.XDG_DATA_HOME, "omp", "plugins");
+  return xdg && (await dirExists(xdg)) ? xdg : homePluginsDir;
+}
+
 async function installedVersion(pluginsDir) {
+  const root = await pluginsRoot(pluginsDir);
   const stamps = [
     [path.join(HOME, ".omp", "agent", "extensions", STAMP_FILE), "stamp"],
-    [path.join(pluginsDir, "node_modules", PLUGIN_DIRNAME, "extensions", STAMP_FILE), "plugin stamp"],
+    [path.join(root, "node_modules", PLUGIN_DIRNAME, "extensions", STAMP_FILE), "plugin stamp"],
   ];
   for (const [file, from] of stamps) {
     const version = parseVersionStamp(await readIfExists(file));
     if (version) return { version, from };
   }
 
-  const lockRaw = await readIfExists(path.join(pluginsDir, "omp-plugins.lock.json"));
+  const lockRaw = await readIfExists(path.join(root, "omp-plugins.lock.json"));
   if (lockRaw) {
     try {
       for (const [name, entry] of Object.entries(JSON.parse(lockRaw)?.plugins ?? {})) {
@@ -1079,6 +1088,11 @@ async function installedVersion(pluginsDir) {
       debug("omp-plugins.lock.json is not readable JSON");
     }
   }
+
+  // Last resort, and the one the runtime also uses: the manifest the installed plugin travels with.
+  const manifest = await readIfExists(path.join(root, "node_modules", PLUGIN_DIRNAME, "package.json"));
+  const manifestVersion = parseVersionStamp(manifest);
+  if (manifestVersion) return { version: manifestVersion, from: "plugin package.json" };
 
   return { version: null, from: null };
 }
