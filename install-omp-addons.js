@@ -1471,6 +1471,18 @@ async function duplicateScopeConflict(scope, userExtDir, projectExtDir) {
   return null;
 }
 
+// Prints the refusal and reports whether the caller must stop. Shared by the install path and the
+// reinstall cleanup, which has to refuse *before* it removes anything.
+async function refusedDuplicateScope(scope, userExtDir, projectExtDir) {
+  const conflict = await duplicateScopeConflict(scope, userExtDir, projectExtDir);
+  if (!conflict || force) return false;
+  console.error(`\n[fail] ${conflict}`);
+  console.error("[hint] Remove the other one first: node install-omp-addons.js uninstall --scope project --yes");
+  console.error("[hint] Or install into both trees on purpose with --force.");
+  process.exitCode = 1;
+  return true;
+}
+
 // The plugin layout takes its extension modules *and* their registration from the marketplace, so
 // this verb installs only what the marketplace cannot: the Ponytail plugin and the rtk binary. No
 // extension copying, no config.yml edit. It refuses to run next to a legacy tree, which would
@@ -1583,7 +1595,19 @@ async function main() {
     // Matches the install default when --scope is absent; an explicit --scope is honoured here and
     // again below, so `reinstall --scope project|both` no longer cleans user scope and then
     // reinstalls user scope anyway.
-    await runUninstall({ yes: true, removePonytail: false, removeRtk: true, scope: scopeFlag || "user" });
+    const reinstallScope = scopeFlag || "user";
+    // Checked before the cleanup: refusing after removing the tree would leave a half-finished
+    // reinstall for a conflict that was visible from the start.
+    const stop = await refusedDuplicateScope(
+      SCOPE_CODES[reinstallScope],
+      path.join(HOME, ".omp", "agent", "extensions"),
+      path.join(process.cwd(), ".omp", "extensions"),
+    );
+    if (stop) {
+      closeRL();
+      return;
+    }
+    await runUninstall({ yes: true, removePonytail: false, removeRtk: true, scope: reinstallScope });
   }
 
   if (dryRun) console.log("[dry-run] No changes will be written.\n");
@@ -1620,12 +1644,7 @@ async function main() {
 
   // D6: refuse a second auto-discovered tree instead of silently registering every extension twice.
   // Runs for a dry run too — the preview has to report the same refusal the real install would hit.
-  const conflict = await duplicateScopeConflict(scope, userExtDir, projectExtDir);
-  if (conflict && !force) {
-    console.error(`\n[fail] ${conflict}`);
-    console.error("[hint] Remove the other one first: node install-omp-addons.js uninstall --scope project --yes");
-    console.error("[hint] Or install into both trees on purpose with --force.");
-    process.exitCode = 1;
+  if (await refusedDuplicateScope(scope, userExtDir, projectExtDir)) {
     closeRL();
     return;
   }

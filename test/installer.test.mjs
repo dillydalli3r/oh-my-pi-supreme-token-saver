@@ -242,6 +242,19 @@ test("a second auto-discovered scope is refused instead of registering everythin
   const forced = run(["install", "--scope", "project", "--dry-run", "--yes", "--force"], { home, cwd });
   assert.equal(forced.code, 0, forced.out);
   assert.doesNotMatch(forced.out, /\[fail\]/);
+
+  // The other direction, plus reinstall refusing before it cleans — a refusal must not leave the
+  // tree half removed. The conflicting project tree has to exist for those to fire at all.
+  seedTree(userExtDir(home), ["caveman-session"]);
+  seedTree(projectExtDir(cwd), ["caveman-session"]);
+
+  const userOverProject = run(["install", "--scope", "user", "--yes"], { home, cwd });
+  assert.equal(userOverProject.code, 1, userOverProject.out);
+  assert.match(userOverProject.out, /register \/caveman and \/rtk twice/);
+
+  const reinstallRun = run(["reinstall", "--scope", "user", "--yes"], { home, cwd });
+  assert.equal(reinstallRun.code, 1, reinstallRun.out);
+  assert.ok(existsSync(join(userExtDir(home), "caveman-session")), "the refused reinstall removed the tree anyway");
 });
 
 test("plugin --dry-run previews the dependencies and writes nothing", () => {
